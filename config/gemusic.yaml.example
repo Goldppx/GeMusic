@@ -1,0 +1,14 @@
+# GeMusic 默认配置文件模板
+# 复制为 gemusic.yaml 并按需修改
+
+# 音乐服务 API 地址
+api_base_url: "https://api.example.com"
+
+# 用户认证 cookies（登录后填写）
+cookies: ""
+
+# 默认播放音量（0-100）
+volume: 80
+
+# 音频缓存目录
+cache_dir: "/tmp/gemusic_cache"
