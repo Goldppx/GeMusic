@@ -1,5 +1,7 @@
 #include "gemusic/config/settings.h"
 
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 
@@ -7,8 +9,30 @@
 
 namespace gemusic::config {
 
+auto ExpandHomePath(std::string_view path) -> std::string {
+    auto path_str = std::string(path);
+    if (path_str.starts_with("~/")) {
+        // 获取用户主目录
+        const char* home = std::getenv("HOME");
+        if (home != nullptr) {
+            path_str.replace(0, 1, home);
+        }
+    }
+    return path_str;
+}
+
+auto GetDefaultConfigPath() -> std::string {
+    return "config/gemusic.yaml";
+}
+
 auto LoadSettings(std::string_view path) -> std::expected<Settings, AppError> {
     try {
+        // 先检查文件是否存在
+        if (!std::filesystem::exists(std::string(path))) {
+            return std::unexpected(
+                AppError{ErrorCode::kFileNotFound, "配置文件不存在: " + std::string(path)});
+        }
+
         // 加载 YAML 配置文件
         YAML::Node config = YAML::LoadFile(std::string(path));
 
@@ -26,6 +50,9 @@ auto LoadSettings(std::string_view path) -> std::expected<Settings, AppError> {
         }
         if (config["cache_dir"]) {
             settings.cache_dir = config["cache_dir"].as<std::string>();
+        }
+        if (config["music_library_path"]) {
+            settings.music_library_path = config["music_library_path"].as<std::string>();
         }
 
         return settings;
@@ -48,6 +75,7 @@ auto SaveSettings(const Settings& settings, std::string_view path)
         out << YAML::Key << "cookies" << YAML::Value << settings.cookies;
         out << YAML::Key << "volume" << YAML::Value << settings.volume;
         out << YAML::Key << "cache_dir" << YAML::Value << settings.cache_dir;
+        out << YAML::Key << "music_library_path" << YAML::Value << settings.music_library_path;
         out << YAML::EndMap;
 
         // 写入文件

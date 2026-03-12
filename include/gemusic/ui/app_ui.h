@@ -2,6 +2,10 @@
 #define GEMUSIC_UI_APP_UI_H
 
 #include <memory>
+#include <string>
+
+#include "gemusic/config/settings.h"
+#include "gemusic/player/music_player.h"
 
 namespace gemusic::ui {
 
@@ -12,8 +16,9 @@ namespace gemusic::ui {
 // - 右侧播放控制面板
 // - 底部状态栏（播放进度、音量等）
 class AppUi {
-public:
-    AppUi();
+   public:
+    // 构造时传入配置、播放器引用和配置文件路径
+    AppUi(config::Settings& settings, player::MusicPlayer& player, std::string config_path);
     ~AppUi();
 
     // 禁止拷贝，允许移动
@@ -25,7 +30,7 @@ public:
     // 启动 TUI 主循环（阻塞调用）
     void Run();
 
-private:
+   private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

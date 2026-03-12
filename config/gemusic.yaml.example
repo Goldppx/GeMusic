@@ -12,3 +12,6 @@ volume: 80
 
 # 音频缓存目录
 cache_dir: "/tmp/gemusic_cache"
+
+# 本地音乐库路径（支持 ~ 表示用户主目录）
+music_library_path: "~/Music"
