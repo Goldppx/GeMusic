@@ -1,0 +1,32 @@
+# 构建目录
+build/
+cmake-build-*/
+
+# IDE 配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 编译产物
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+
+# CMake 生成文件
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 配置文件（可能包含敏感信息如 cookies）
+config/*.yaml
+!config/*.yaml.example
