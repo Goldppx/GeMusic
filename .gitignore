@@ -27,6 +27,9 @@ compile_commands.json
 .DS_Store
 Thumbs.db
 
+# 工具缓存
+.cache/
+
 # 配置文件（可能包含敏感信息如 cookies）
 config/*.yaml
 !config/*.yaml.example

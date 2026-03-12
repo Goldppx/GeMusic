@@ -4,6 +4,7 @@
 #include <memory>
 #include <string>
 
+#include "gemusic/auth/login_manager.h"
 #include "gemusic/config/settings.h"
 #include "gemusic/player/music_player.h"
 
@@ -17,8 +18,9 @@ namespace gemusic::ui {
 // - 底部状态栏（播放进度、音量等）
 class AppUi {
    public:
-    // 构造时传入配置、播放器引用和配置文件路径
-    AppUi(config::Settings& settings, player::MusicPlayer& player, std::string config_path);
+    // 构造时传入配置、播放器、登录管理器引用和配置文件路径
+    AppUi(config::Settings& settings, player::MusicPlayer& player,
+          auth::LoginManager& login_manager, std::string config_path);
     ~AppUi();
 
     // 禁止拷贝，允许移动

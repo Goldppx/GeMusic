@@ -24,8 +24,7 @@ struct MusicPlayer::Impl {
         // 初始化 miniaudio 引擎
         auto result = ma_engine_init(nullptr, &engine);
         if (result != MA_SUCCESS) {
-            std::cerr << "miniaudio 引擎初始化失败，错误码: " << result
-                      << std::endl;
+            std::cerr << "miniaudio 引擎初始化失败，错误码: " << result << std::endl;
             return;
         }
         engine_initialized = true;
@@ -55,13 +54,11 @@ MusicPlayer::~MusicPlayer() = default;
 MusicPlayer::MusicPlayer(MusicPlayer&&) noexcept = default;
 auto MusicPlayer::operator=(MusicPlayer&&) noexcept -> MusicPlayer& = default;
 
-auto MusicPlayer::Play(std::string_view source)
-    -> std::expected<void, AppError> {
+auto MusicPlayer::Play(std::string_view source) -> std::expected<void, AppError> {
     std::lock_guard lock(impl_->mutex);
 
     if (!impl_->engine_initialized) {
-        return std::unexpected(
-            AppError{ErrorCode::kPlayerError, "音频引擎未初始化"});
+        return std::unexpected(AppError{ErrorCode::kPlayerError, "音频引擎未初始化"});
     }
 
     // 如果之前有加载的音频，先卸载
@@ -73,15 +70,13 @@ auto MusicPlayer::Play(std::string_view source)
     impl_->SetState(PlayerState::kLoading);
 
     // 加载音频源
-    const auto result = ma_sound_init_from_file(
-        &impl_->engine, std::string(source).c_str(), 0, nullptr, nullptr,
-        &impl_->sound);
+    const auto result = ma_sound_init_from_file(&impl_->engine, std::string(source).c_str(), 0,
+                                                nullptr, nullptr, &impl_->sound);
 
     if (result != MA_SUCCESS) {
         impl_->SetState(PlayerState::kStopped);
-        return std::unexpected(AppError{
-            ErrorCode::kPlayerError,
-            std::string("加载音频失败: ") + std::string(source)});
+        return std::unexpected(
+            AppError{ErrorCode::kPlayerError, std::string("加载音频失败: ") + std::string(source)});
     }
 
     impl_->sound_loaded = true;
@@ -132,26 +127,32 @@ void MusicPlayer::SetVolume(int volume) {
     ma_engine_set_volume(&impl_->engine, vol);
 }
 
-auto MusicPlayer::Seek(uint32_t position_ms)
-    -> std::expected<void, AppError> {
+auto MusicPlayer::Seek(uint32_t position_ms) -> std::expected<void, AppError> {
     std::lock_guard lock(impl_->mutex);
     if (!impl_->sound_loaded) {
-        return std::unexpected(
-            AppError{ErrorCode::kPlayerError, "没有正在播放的音频"});
+        return std::unexpected(AppError{ErrorCode::kPlayerError, "没有正在播放的音频"});
     }
 
     // 将毫秒转换为采样帧
     const auto sample_rate = ma_engine_get_sample_rate(&impl_->engine);
-    const auto frame =
-        static_cast<ma_uint64>(position_ms) * sample_rate / 1000;
+    const auto frame = static_cast<ma_uint64>(position_ms) * sample_rate / 1000;
     ma_sound_seek_to_pcm_frame(&impl_->sound, frame);
 
     return {};
 }
 
-auto MusicPlayer::GetState() const -> PlayerState { return impl_->state; }
+auto MusicPlayer::GetState() const -> PlayerState {
+    return impl_->state;
+}
 
 auto MusicPlayer::GetTrackInfo() const -> const TrackInfo& {
+    // 每次调用时从 miniaudio 读取最新播放位置，保证进度条数据实时
+    // impl_ 是 unique_ptr<Impl>，const 方法中指针本身不可变，但指向的 Impl 对象可修改
+    if (impl_->sound_loaded && impl_->state != PlayerState::kStopped) {
+        float cursor = 0.0F;
+        ma_sound_get_cursor_in_seconds(&impl_->sound, &cursor);
+        impl_->track_info.position_ms = static_cast<uint32_t>(cursor * 1000.0F);
+    }
     return impl_->track_info;
 }
 

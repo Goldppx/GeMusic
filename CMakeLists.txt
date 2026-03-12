@@ -38,8 +38,28 @@ FetchContent_Declare(
     SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/googletest-src
 )
 
+# spdlog - 日志库（使用本地已下载的源码）
+FetchContent_Declare(
+    spdlog
+    SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/spdlog-src
+)
+
 # 统一拉取所有依赖
-FetchContent_MakeAvailable(ftxui json yaml-cpp googletest)
+FetchContent_MakeAvailable(ftxui json yaml-cpp googletest spdlog)
+
+# OpenSSL - AES-CBC + RSA 加密（网易云接口加密必须）
+find_package(OpenSSL REQUIRED)
+
+# qrcodegen - 二维码生成（nayuki/QR-Code-generator，仅两个文件）
+# 使用本地已下载的源码，以 STATIC 库形式编译
+add_library(qrcodegen STATIC
+    ${CMAKE_BINARY_DIR}/_deps/qrcodegen-src/qrcodegen.cpp
+)
+target_include_directories(qrcodegen PUBLIC
+    ${CMAKE_BINARY_DIR}/_deps/qrcodegen-src
+)
+# qrcodegen 内部不符合严格警告，单独关闭 Werror
+target_compile_options(qrcodegen PRIVATE -w)
 
 # ============================================================
 # 主程序目标
@@ -60,6 +80,9 @@ target_link_libraries(GeMusic PRIVATE
     ftxui::component
     nlohmann_json::nlohmann_json
     yaml-cpp::yaml-cpp
+    OpenSSL::Crypto
+    qrcodegen
+    spdlog::spdlog
     curl
     pthread
 )
@@ -94,6 +117,9 @@ if(TEST_SOURCES)
         ftxui::screen
         ftxui::dom
         ftxui::component
+        OpenSSL::Crypto
+        qrcodegen
+        spdlog::spdlog
         curl
         pthread
     )

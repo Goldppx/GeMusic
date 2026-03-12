@@ -15,8 +15,11 @@ struct Settings {
     // 服务器 API 地址
     std::string api_base_url;
 
-    // 用户认证 cookies
+    // 用户认证 cookies（包含 MUSIC_U 等网易云登录凭证）
     std::string cookies;
+
+    // 已登录的用户名（登录成功后由 LoginManager 写入）
+    std::string user_name;
 
     // 默认播放音量（0-100）
     int volume = 80;
