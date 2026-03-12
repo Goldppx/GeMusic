@@ -156,6 +156,14 @@ auto MusicPlayer::GetTrackInfo() const -> const TrackInfo& {
     return impl_->track_info;
 }
 
+auto MusicPlayer::IsAtEnd() const -> bool {
+    // ma_sound_at_end 是 miniaudio 提供的线程安全接口，无需加锁
+    if (!impl_->sound_loaded) {
+        return false;
+    }
+    return ma_sound_at_end(&impl_->sound) == MA_TRUE;
+}
+
 void MusicPlayer::OnStateChanged(StateCallback callback) {
     impl_->state_callback = std::move(callback);
 }

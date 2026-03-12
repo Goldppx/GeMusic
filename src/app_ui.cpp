@@ -102,6 +102,10 @@ struct AppUi::Impl {
     std::string queue_status_;
     // 保护队列数据的互斥锁（加锁顺序：先 tracks_mutex_ 后 queue_mutex_）
     mutable std::mutex queue_mutex_;
+    // 播放列表页面中当前选中的条目索引（供 FTXUI Menu 组件与键盘导航使用）
+    int selected_queue_track_ = 0;
+    // 供 FTXUI Menu 组件使用的队列条目显示名称列表（与 play_queue_ 保持同步）
+    std::vector<std::string> queue_display_names_;
 
     // 设置页面登录区的三个内联按钮（在 Run() 中初始化）
     // 渲染为 "[label]" 样式的可聚焦文字链接
@@ -382,6 +386,55 @@ struct AppUi::Impl {
         PlayQueueAt(prev, screen_ref);
     }
 
+    // 重建 queue_display_names_（须在持有 queue_mutex_ 时调用）
+    // 与 play_queue_ 保持一对一映射，供队列页面 Menu 组件使用
+    // 同时将 selected_queue_track_ 边界夹紧，防止越界
+    void SyncQueueDisplayNames() {
+        queue_display_names_.clear();
+        queue_display_names_.reserve(play_queue_.size());
+        for (const auto& entry : play_queue_) {
+            queue_display_names_.push_back(entry.display_name);
+        }
+        // 夹紧选中索引：若队列变短则退到最后一项，若为空则归零
+        const int sz = static_cast<int>(play_queue_.size());
+        if (sz == 0) {
+            selected_queue_track_ = 0;
+        } else if (selected_queue_track_ >= sz) {
+            selected_queue_track_ = sz - 1;
+        }
+    }
+
+    // 从播放队列中移除指定索引的条目
+    // 调整 current_queue_index_ 和 selected_queue_track_，并同步显示名称列表
+    void RemoveFromQueue(int idx, ScreenInteractive& screen_ref) {
+        {
+            const std::lock_guard<std::mutex> lock(queue_mutex_);
+            if (idx < 0 || static_cast<size_t>(idx) >= play_queue_.size())
+                return;
+
+            play_queue_.erase(play_queue_.begin() + static_cast<ptrdiff_t>(idx));
+
+            // 调整「正在播放」指针
+            if (play_queue_.empty()) {
+                current_queue_index_ = -1;
+                queue_status_.clear();
+            } else if (idx < current_queue_index_) {
+                // 删除的是当前播放项前面的条目，索引前移一位
+                --current_queue_index_;
+            } else if (idx == current_queue_index_) {
+                // 删除的是当前播放项，指向下一首（如已是末尾则指向新末尾）
+                if (current_queue_index_ >= static_cast<int>(play_queue_.size())) {
+                    current_queue_index_ = static_cast<int>(play_queue_.size()) - 1;
+                }
+                // current_queue_index_ 现在指向原来的下一首，无需额外操作
+            }
+            // idx > current_queue_index_：删除的是后面的条目，当前播放指针不变
+
+            SyncQueueDisplayNames();
+        }
+        screen_ref.PostEvent(ftxui::Event::Custom);
+    }
+
     // 内部：用给定曲目列表替换整个播放队列，并从 start_index 开始播放
     void ReplaceQueueWithTracks(const std::vector<network::Track>& tracks, int start_index,
                                 ScreenInteractive& screen_ref) {
@@ -396,6 +449,10 @@ struct AppUi::Impl {
                 play_queue_.push_back(QueueEntry{tr.id, std::move(name)});
             }
             current_queue_index_ = -1;
+            // 将列表光标置于起始播放位置，方便用户在播放列表页面定位
+            selected_queue_track_ =
+                std::clamp(start_index, 0, std::max(0, static_cast<int>(play_queue_.size()) - 1));
+            SyncQueueDisplayNames();
         }
         PlayQueueAt(start_index, screen_ref);
     }
@@ -474,6 +531,7 @@ struct AppUi::Impl {
             was_empty = play_queue_.empty();
             play_queue_.push_back(QueueEntry{tr.id, name});
             new_idx = static_cast<int>(play_queue_.size()) - 1;
+            SyncQueueDisplayNames();
         }
         if (was_empty) {
             PlayQueueAt(new_idx, screen_ref);
@@ -538,6 +596,54 @@ struct AppUi::Impl {
         }
         const std::lock_guard<std::mutex> lock(playlists_mutex_);
         return BuildPlaylistListContent();
+    }
+
+    // 播放列表页面：展示当前播放队列
+    // ♪ 标记正在播放的条目，高亮反显当前光标选中项（两者可不同）
+    auto BuildQueueContent() -> Element {
+        Elements items;
+        items.push_back(text("播放列表") | bold | center);
+        items.push_back(separator());
+
+        const std::lock_guard<std::mutex> lock(queue_mutex_);
+
+        if (play_queue_.empty()) {
+            // 队列为空时给出引导提示
+            items.push_back(filler());
+            items.push_back(text("播放列表为空") | dim | center);
+            items.push_back(text("在「我的歌单」曲目列表中按 Enter 加载歌单") | dim | center);
+            items.push_back(filler());
+        } else {
+            items.push_back(text("共 " + std::to_string(play_queue_.size()) + " 首") | dim);
+            items.push_back(separator());
+
+            for (size_t i = 0; i < play_queue_.size(); ++i) {
+                const bool is_now_playing = (static_cast<int>(i) == current_queue_index_);
+                const bool is_selected = (static_cast<int>(i) == selected_queue_track_);
+
+                // 左侧图标：♪ 表示正在播放，空格占位保持对齐
+                auto icon = text(is_now_playing ? "♪ " : "  ");
+                auto name = text(play_queue_[i].display_name) | flex;
+
+                auto row = hbox({std::move(icon), std::move(name)});
+
+                if (is_selected && is_now_playing) {
+                    // 光标与播放项重合：高亮 + 青色
+                    row = row | inverted | color(Color::Cyan);
+                } else if (is_selected) {
+                    row = row | inverted;
+                } else if (is_now_playing) {
+                    // 仅播放中：绿色标记
+                    row = row | color(Color::Green);
+                }
+                items.push_back(row);
+            }
+        }
+
+        items.push_back(filler());
+        items.push_back(separator());
+        items.push_back(text("Enter/Shift+Enter: 跳播  d: 删除  [/]: 上/下一首") | dim);
+        return vbox(std::move(items)) | flex;
     }
 
     // 使用系统默认编辑器打开配置文件    // 流程：
@@ -980,6 +1086,11 @@ void AppUi::Run() {
     // 构建左侧菜单组件
     auto menu = impl_->BuildMenu();
 
+    // 播放列表页面：queue_menu 负责上下键导航（维护 selected_queue_track_），
+    // BuildQueueContent 提供自定义渲染（♪ 播放标记、高亮、操作提示）
+    auto queue_menu = Menu(&impl_->queue_display_names_, &impl_->selected_queue_track_);
+    auto queue_page = Renderer(queue_menu, [this] { return impl_->BuildQueueContent(); });
+
     // 本地文件列表的 Menu 组件（处理上下键导航，同步 selected_local_track）
     auto local_menu = Menu(&impl_->local_file_names, &impl_->selected_local_track);
 
@@ -989,9 +1100,8 @@ void AppUi::Run() {
     // 这样确保组件树（事件/焦点）与渲染树（Element）保持对齐，
     // 解决直接调用 BuildXxx() 导致的渲染链断裂、按钮无法获取焦点的问题。
 
-    // 占位页面：各自独立实例，避免同一 Component 被 Add 到同一容器多次
-    auto placeholder_0 = Renderer([this] { return impl_->BuildPlaceholderContent(); });
-    auto placeholder_1 = Renderer([this] { return impl_->BuildPlaceholderContent(); });
+    // 占位页面：搜索功能待实现
+    auto placeholder_search = Renderer([this] { return impl_->BuildPlaceholderContent(); });
 
     // 我的歌单页面：两层导航
     //   - playlists_menu：歌单列表视图的上下键导航（维护 selected_playlist_）
@@ -1018,11 +1128,11 @@ void AppUi::Run() {
     // 右侧内容区域的组件容器（Tab 页由 selected_menu 索引控制）
     auto content_container = Container::Tab(
         {
-            placeholder_0,      // 0: 播放列表
-            placeholder_1,      // 1: 搜索
-            my_playlists_page,  // 2: 我的歌单（带 playlists_menu 交互）
-            local_files_page,   // 3: 本地文件（带 local_menu 交互）
-            settings_page,      // 4: 设置（带 settings_buttons 交互）
+            queue_page,          // 0: 播放列表（当前播放队列）
+            placeholder_search,  // 1: 搜索（待实现）
+            my_playlists_page,   // 2: 我的歌单（带 playlists_menu 交互）
+            local_files_page,    // 3: 本地文件（带 local_menu 交互）
+            settings_page,       // 4: 设置（带 settings_buttons 交互）
         },
         &impl_->selected_menu);
 
@@ -1069,6 +1179,28 @@ void AppUi::Run() {
         if (event == Event::Character(']')) {
             impl_->PlayNextTrack(impl_->screen);
             return true;
+        }
+
+        // ── 播放列表页面（当前播放队列）──
+        if (impl_->selected_menu == 0) {
+            if (event == Event::Return || event == kShiftEnter) {
+                // Enter / Shift+Enter：跳转并播放选中条目
+                int idx = impl_->selected_queue_track_;
+                bool valid = false;
+                {
+                    const std::lock_guard<std::mutex> lock(impl_->queue_mutex_);
+                    valid = (idx >= 0 && static_cast<size_t>(idx) < impl_->play_queue_.size());
+                }
+                if (valid) {
+                    impl_->PlayQueueAt(idx, impl_->screen);
+                }
+                return true;
+            }
+            if (event == Event::Character('d')) {
+                // d：删除选中条目
+                impl_->RemoveFromQueue(impl_->selected_queue_track_, impl_->screen);
+                return true;
+            }
         }
 
         // ── 我的歌单页面 ──
@@ -1144,11 +1276,28 @@ void AppUi::Run() {
 
     // 启动 500ms 定时刷新线程，驱动播放进度条更新
     // 线程通过 PostEvent(Custom) 触发 FTXUI 重绘，Loop 返回后通过 stop_refresh 标志退出
+    // 同时在每次刷新时检测歌曲自然结束，若结束则自动跳至队列下一首
     std::atomic<bool> stop_refresh{false};
     std::thread refresh_thread([&] {
         while (!stop_refresh.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             if (!stop_refresh.load()) {
+                // ── 自动连续播放：检测歌曲是否自然播放结束 ──
+                // 条件：播放器仍报告 kPlaying（状态未被手动改变）且音频已到结尾
+                if (impl_->player.GetState() == player::PlayerState::kPlaying &&
+                    impl_->player.IsAtEnd()) {
+                    // 立即停止，防止 500ms 内重复触发
+                    impl_->player.Stop();
+                    // 检查是否有队列可切换
+                    bool has_queue = false;
+                    {
+                        const std::lock_guard<std::mutex> lock(impl_->queue_mutex_);
+                        has_queue = !impl_->play_queue_.empty();
+                    }
+                    if (has_queue) {
+                        impl_->PlayNextTrack(impl_->screen);
+                    }
+                }
                 impl_->screen.PostEvent(ftxui::Event::Custom);
             }
         }
