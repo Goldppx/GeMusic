@@ -279,6 +279,12 @@ struct LoginManager::Impl {
             settings.user_name = resp.json["account"]["userName"].get<std::string>();
         }
 
+        // 读取账户数字 ID（用于后续调用歌单等业务 API）
+        if (resp.json.contains("account") && resp.json["account"].is_object() &&
+            resp.json["account"].contains("id")) {
+            settings.user_id = resp.json["account"]["id"].get<int64_t>();
+        }
+
         spdlog::info("获取用户名成功: {}", settings.user_name);
         return true;
     }
@@ -342,6 +348,12 @@ struct LoginManager::Impl {
         } else if (resp.json.contains("account") && resp.json["account"].is_object() &&
                    resp.json["account"].contains("userName")) {
             settings.user_name = resp.json["account"]["userName"].get<std::string>();
+        }
+
+        // 同步解析数字 ID（自动登录成功场景）
+        if (resp.json.contains("account") && resp.json["account"].is_object() &&
+            resp.json["account"].contains("id")) {
+            settings.user_id = resp.json["account"]["id"].get<int64_t>();
         }
 
         spdlog::info("自动登录成功，用户: {}", settings.user_name);
@@ -441,6 +453,7 @@ void LoginManager::Logout() {
     // 清除登录状态
     impl_->settings.cookies.clear();
     impl_->settings.user_name.clear();
+    impl_->settings.user_id = 0;
     impl_->api_client.SetCookies("");
 
     {

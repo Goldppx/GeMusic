@@ -65,6 +65,13 @@ class ApiClient {
     // 获取当前 cookies 字符串
     [[nodiscard]] auto GetCookies() const -> const std::string&;
 
+    // 将指定 URL 的内容下载到本地文件（用于音频缓存，直接使用绝对 URL，不依赖 base_url）
+    // 参数: url       - 完整的 HTTP/HTTPS 音频 URL
+    //        dest_path - 本地保存路径
+    // 返回: 成功时返回 void，失败时返回 AppError
+    auto DownloadFile(std::string_view url, std::string_view dest_path)
+        -> std::expected<void, AppError>;
+
    private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

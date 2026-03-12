@@ -3,6 +3,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -14,6 +16,8 @@
 #include "gemusic/auth/login_manager.h"
 #include "gemusic/config/settings.h"
 #include "gemusic/library/local_library.h"
+#include "gemusic/network/api_client.h"
+#include "gemusic/network/netease_api.h"
 #include "gemusic/player/music_player.h"
 
 namespace gemusic::ui {
@@ -36,7 +40,7 @@ struct AppUi::Impl {
 
     // 侧边栏菜单条目
     std::vector<std::string> menu_entries = {
-        "播放列表", "搜索", "我的收藏", "本地文件", "设置",
+        "播放列表", "搜索", "我的歌单", "本地文件", "设置",
     };
 
     // 本地文件页面的状态
@@ -47,6 +51,57 @@ struct AppUi::Impl {
 
     // 设置页面状态
     std::string open_config_status;  // 打开配置文件的状态提示
+
+    // ── 我的歌单页面状态 ──
+    // 受 playlists_mutex_ 保护，后台线程写入，UI 线程只读
+    std::vector<network::Playlist> user_playlists_;
+    // 供 FTXUI Menu 组件使用的显示名称列表（格式："[自] 歌单名 (N首)" 或 "歌单名 (N首)"）
+    std::vector<std::string> playlist_display_names_;
+    // 当前在歌单列表中选中的条目索引
+    int selected_playlist_ = 0;
+    // 状态提示文字（"加载中..." / "共 N 个歌单" / 错误信息）
+    std::string playlist_status_;
+    // true 表示后台请求正在进行中
+    bool playlists_loading_ = false;
+    // 保护歌单数据的互斥锁
+    mutable std::mutex playlists_mutex_;
+    // 用于 FetchUserPlaylists 的 HTTP 客户端（专用实例，含已登录 cookies）
+    network::ApiClient playlists_api_client_{"", ""};
+
+    // ── 歌单详情视图状态 ──
+    // 0 = 歌单列表视图，1 = 曲目列表视图；同时作为 Container::Tab 索引
+    int playlist_view_index_ = 0;
+    // 当前打开的歌单 ID（用于防止重复加载）
+    int64_t open_playlist_id_ = 0;
+    // 当前打开的歌单名称（用于详情页标题）
+    std::string open_playlist_name_;
+    // 当前打开歌单的完整曲目列表（受 tracks_mutex_ 保护）
+    std::vector<network::Track> open_playlist_tracks_;
+    // 供 FTXUI Menu 组件使用的曲目显示名称列表（"序号. 歌名 - 艺术家"）
+    std::vector<std::string> track_display_names_;
+    // 当前在曲目列表中选中的条目索引
+    int selected_track_ = 0;
+    // 曲目列表状态提示（"加载中..." / "共 N 首" / 错误信息）
+    std::string track_list_status_;
+    // true 表示曲目列表后台请求进行中
+    bool track_list_loading_ = false;
+    // 保护曲目数据的互斥锁（加锁顺序：先 tracks_mutex_ 后 queue_mutex_）
+    mutable std::mutex tracks_mutex_;
+
+    // ── 播放队列状态 ──
+    // 播放队列条目（歌曲 ID + 显示名称）
+    struct QueueEntry {
+        int64_t song_id;
+        std::string display_name;
+    };
+    // 当前播放队列
+    std::vector<QueueEntry> play_queue_;
+    // 当前播放队列中正在播放的索引（-1 表示无）
+    int current_queue_index_ = -1;
+    // 显示在播放控制栏的队列状态（如 "♪ 歌名 (3/15)"）
+    std::string queue_status_;
+    // 保护队列数据的互斥锁（加锁顺序：先 tracks_mutex_ 后 queue_mutex_）
+    mutable std::mutex queue_mutex_;
 
     // 设置页面登录区的三个内联按钮（在 Run() 中初始化）
     // 渲染为 "[label]" 样式的可聚焦文字链接
@@ -99,8 +154,393 @@ struct AppUi::Impl {
         }
     }
 
-    // 使用系统默认编辑器打开配置文件
+    // 在后台线程中拉取用户歌单列表
+    // 完成后通过 screen.PostEvent(Custom) 触发 UI 刷新
+    // 参数: screen_ref - FTXUI 屏幕引用（用于 PostEvent）
+    void LoadUserPlaylists(ScreenInteractive& screen_ref) {
+        {
+            const std::lock_guard<std::mutex> lock(playlists_mutex_);
+            // 避免重复请求
+            if (playlists_loading_) {
+                return;
+            }
+            playlists_loading_ = true;
+            playlist_status_ = "加载中...";
+        }
+        // 刷新一次让"加载中..."立即显示
+        screen_ref.PostEvent(ftxui::Event::Custom);
+
+        // 在独立线程中发起网络请求，避免阻塞渲染线程
+        std::thread([this, &screen_ref] {
+            // 将当前已登录的 cookies 同步到专用客户端
+            playlists_api_client_.SetCookies(settings.cookies);
+
+            auto result = network::FetchUserPlaylists(playlists_api_client_, settings.user_id);
+
+            {
+                const std::lock_guard<std::mutex> lock(playlists_mutex_);
+                playlists_loading_ = false;
+
+                if (!result) {
+                    // 请求失败，显示错误信息
+                    playlist_status_ = "获取失败: " + result.error().message;
+                    user_playlists_.clear();
+                    playlist_display_names_.clear();
+                } else {
+                    user_playlists_ = std::move(result.value());
+                    // 构造显示名称："名称 (N首)"（不区分自建或收藏歌单）
+                    playlist_display_names_.clear();
+                    playlist_display_names_.reserve(user_playlists_.size());
+                    for (const auto& pl : user_playlists_) {
+                        std::string display = pl.name;
+                        display += " (" + std::to_string(pl.track_count) + "首)";
+                        playlist_display_names_.push_back(std::move(display));
+                    }
+                    playlist_status_ = "共 " + std::to_string(user_playlists_.size()) + " 个歌单";
+                    selected_playlist_ = 0;
+                }
+            }
+            // 通知 UI 刷新
+            screen_ref.PostEvent(ftxui::Event::Custom);
+        }).detach();
+    }
+
+    // ── 歌单详情与播放队列相关方法 ──
+
+    // 打开选中歌单的曲目详情视图；若 ID 未变则使用缓存直接切换
+    void OpenPlaylistDetail(ScreenInteractive& screen_ref) {
+        int64_t playlist_id = 0;
+        std::string playlist_name;
+        {
+            const std::lock_guard<std::mutex> lock(playlists_mutex_);
+            if (user_playlists_.empty())
+                return;
+            const auto idx = static_cast<size_t>(selected_playlist_);
+            if (idx >= user_playlists_.size())
+                return;
+            playlist_id = user_playlists_[idx].id;
+            playlist_name = user_playlists_[idx].name;
+        }
+        // 切换到曲目视图
+        playlist_view_index_ = 1;
+        open_playlist_name_ = playlist_name;
+        // 若已缓存同一歌单，直接展示
+        {
+            const std::lock_guard<std::mutex> lock(tracks_mutex_);
+            if (playlist_id == open_playlist_id_ && !open_playlist_tracks_.empty()) {
+                screen_ref.PostEvent(ftxui::Event::Custom);
+                return;
+            }
+            open_playlist_id_ = playlist_id;
+            open_playlist_tracks_.clear();
+            track_display_names_.clear();
+            selected_track_ = 0;
+            track_list_loading_ = true;
+            track_list_status_ = "加载中...";
+        }
+        screen_ref.PostEvent(ftxui::Event::Custom);
+        // 后台线程请求曲目列表
+        std::thread([this, playlist_id, &screen_ref] {
+            network::ApiClient api_client{"", settings.cookies};
+            auto result = network::FetchPlaylistTracks(api_client, playlist_id);
+            {
+                const std::lock_guard<std::mutex> lock(tracks_mutex_);
+                track_list_loading_ = false;
+                if (!result) {
+                    track_list_status_ = "获取失败: " + result.error().message;
+                    open_playlist_tracks_.clear();
+                    track_display_names_.clear();
+                } else {
+                    open_playlist_tracks_ = std::move(result.value());
+                    track_display_names_.clear();
+                    track_display_names_.reserve(open_playlist_tracks_.size());
+                    for (size_t i = 0; i < open_playlist_tracks_.size(); ++i) {
+                        const auto& tr = open_playlist_tracks_[i];
+                        std::string disp = std::to_string(i + 1) + ". " + tr.name;
+                        if (!tr.artist.empty())
+                            disp += " - " + tr.artist;
+                        track_display_names_.push_back(std::move(disp));
+                    }
+                    track_list_status_ =
+                        "共 " + std::to_string(open_playlist_tracks_.size()) + " 首";
+                    selected_track_ = 0;
+                }
+            }
+            screen_ref.PostEvent(ftxui::Event::Custom);
+        }).detach();
+    }
+
+    // 内部：跳转到队列指定索引，后台获取 URL、下载到本地缓存，再调用 player.Play()
     // 流程：
+    //   1. 构造缓存文件路径 {cache_dir}/{song_id}.mp3
+    //   2. 若缓存文件已存在且非空，跳过 API 请求和下载，直接播放本地文件
+    //   3. 否则调用 FetchSongUrl 获取 CDN 地址，再调用 DownloadFile 下载到缓存
+    //   4. 最终调用 player.Play(cache_path)（本地路径，miniaudio 可正常加载）
+    void PlayQueueAt(int idx, ScreenInteractive& screen_ref) {
+        int64_t song_id = 0;
+        std::string display_name;
+        int queue_size = 0;
+        {
+            const std::lock_guard<std::mutex> lock(queue_mutex_);
+            if (idx < 0 || static_cast<size_t>(idx) >= play_queue_.size())
+                return;
+            current_queue_index_ = idx;
+            song_id = play_queue_[static_cast<size_t>(idx)].song_id;
+            display_name = play_queue_[static_cast<size_t>(idx)].display_name;
+            queue_size = static_cast<int>(play_queue_.size());
+        }
+        // 立即更新状态栏，给用户即时反馈
+        queue_status_ = "♪ " + display_name + " (" + std::to_string(idx + 1) + "/" +
+                        std::to_string(queue_size) + ")";
+        screen_ref.PostEvent(ftxui::Event::Custom);
+
+        // 后台线程：先检查缓存，再按需下载，最后播放
+        std::thread([this, song_id, display_name, idx, queue_size, &screen_ref] {
+            // 构造缓存文件路径
+            const std::string cache_dir = config::ExpandHomePath(settings.cache_dir);
+            const std::string cache_path = cache_dir + "/" + std::to_string(song_id) + ".mp3";
+
+            // 检查缓存文件是否已存在且非空（避免重复下载）
+            std::error_code ec;
+            const auto file_size = std::filesystem::file_size(cache_path, ec);
+            const bool cache_hit = (!ec && file_size > 0);
+
+            if (!cache_hit) {
+                // 缓存未命中：先获取 CDN 地址
+                network::ApiClient api_client{"", settings.cookies};
+                auto url_result = network::FetchSongUrl(api_client, song_id);
+                if (!url_result) {
+                    queue_status_ = "获取地址失败: " + url_result.error().message;
+                    screen_ref.PostEvent(ftxui::Event::Custom);
+                    return;
+                }
+                if (url_result.value().empty()) {
+                    // 版权限制，自动跳下一首
+                    queue_status_ = "歌曲不可用，跳至下一首...";
+                    screen_ref.PostEvent(ftxui::Event::Custom);
+                    PlayNextTrack(screen_ref);
+                    return;
+                }
+
+                // 确保缓存目录存在
+                std::filesystem::create_directories(cache_dir, ec);
+                if (ec) {
+                    queue_status_ = "创建缓存目录失败: " + ec.message();
+                    screen_ref.PostEvent(ftxui::Event::Custom);
+                    return;
+                }
+
+                // 更新状态栏：提示正在下载
+                queue_status_ = "下载中: " + display_name + " (" + std::to_string(idx + 1) + "/" +
+                                std::to_string(queue_size) + ")";
+                screen_ref.PostEvent(ftxui::Event::Custom);
+
+                // 下载音频到本地缓存文件
+                auto dl_result = api_client.DownloadFile(url_result.value(), cache_path);
+                if (!dl_result) {
+                    queue_status_ = "下载失败: " + dl_result.error().message;
+                    screen_ref.PostEvent(ftxui::Event::Custom);
+                    return;
+                }
+            }
+
+            // 恢复播放状态栏显示
+            queue_status_ = "♪ " + display_name + " (" + std::to_string(idx + 1) + "/" +
+                            std::to_string(queue_size) + ")";
+
+            // 使用本地缓存路径播放（miniaudio 仅支持本地文件，不支持 HTTP URL）
+            auto play_res = player.Play(cache_path);
+            if (!play_res) {
+                queue_status_ = "播放失败: " + play_res.error().message;
+                screen_ref.PostEvent(ftxui::Event::Custom);
+            }
+        }).detach();
+    }
+
+    // 播放队列下一首（队尾回绕到队头）
+    void PlayNextTrack(ScreenInteractive& screen_ref) {
+        int next = 0;
+        {
+            const std::lock_guard<std::mutex> lock(queue_mutex_);
+            if (play_queue_.empty())
+                return;
+            next = (current_queue_index_ + 1) % static_cast<int>(play_queue_.size());
+        }
+        PlayQueueAt(next, screen_ref);
+    }
+
+    // 播放队列上一首（队头回绕到队尾）
+    void PlayPrevTrack(ScreenInteractive& screen_ref) {
+        int prev = 0;
+        {
+            const std::lock_guard<std::mutex> lock(queue_mutex_);
+            if (play_queue_.empty())
+                return;
+            const int sz = static_cast<int>(play_queue_.size());
+            prev = (current_queue_index_ - 1 + sz) % sz;
+        }
+        PlayQueueAt(prev, screen_ref);
+    }
+
+    // 内部：用给定曲目列表替换整个播放队列，并从 start_index 开始播放
+    void ReplaceQueueWithTracks(const std::vector<network::Track>& tracks, int start_index,
+                                ScreenInteractive& screen_ref) {
+        {
+            const std::lock_guard<std::mutex> lock(queue_mutex_);
+            play_queue_.clear();
+            play_queue_.reserve(tracks.size());
+            for (const auto& tr : tracks) {
+                std::string name = tr.name;
+                if (!tr.artist.empty())
+                    name += " - " + tr.artist;
+                play_queue_.push_back(QueueEntry{tr.id, std::move(name)});
+            }
+            current_queue_index_ = -1;
+        }
+        PlayQueueAt(start_index, screen_ref);
+    }
+
+    // Shift+Enter 在歌单列表：用整个歌单替换播放队列并从头播放
+    void LoadAndReplaceQueue(ScreenInteractive& screen_ref) {
+        int64_t playlist_id = 0;
+        {
+            const std::lock_guard<std::mutex> lock(playlists_mutex_);
+            if (user_playlists_.empty())
+                return;
+            const auto idx = static_cast<size_t>(selected_playlist_);
+            if (idx >= user_playlists_.size())
+                return;
+            playlist_id = user_playlists_[idx].id;
+        }
+        // 优先使用缓存
+        std::vector<network::Track> cached;
+        {
+            const std::lock_guard<std::mutex> lock(tracks_mutex_);
+            if (playlist_id == open_playlist_id_ && !open_playlist_tracks_.empty())
+                cached = open_playlist_tracks_;
+        }
+        if (!cached.empty()) {
+            ReplaceQueueWithTracks(cached, 0, screen_ref);
+            return;
+        }
+        // 无缓存，后台请求
+        queue_status_ = "正在加载歌单...";
+        screen_ref.PostEvent(ftxui::Event::Custom);
+        std::thread([this, playlist_id, &screen_ref] {
+            network::ApiClient api_client{"", settings.cookies};
+            auto result = network::FetchPlaylistTracks(api_client, playlist_id);
+            if (!result) {
+                queue_status_ = "加载失败: " + result.error().message;
+                screen_ref.PostEvent(ftxui::Event::Custom);
+                return;
+            }
+            ReplaceQueueWithTracks(result.value(), 0, screen_ref);
+        }).detach();
+    }
+
+    // Enter 在曲目列表：用整个歌单替换队列，从选中曲目开始播放
+    void PlayTrackFromDetail(ScreenInteractive& screen_ref) {
+        std::vector<network::Track> snapshot;
+        int start = 0;
+        {
+            const std::lock_guard<std::mutex> lock(tracks_mutex_);
+            if (open_playlist_tracks_.empty())
+                return;
+            snapshot = open_playlist_tracks_;
+            start = selected_track_;
+        }
+        ReplaceQueueWithTracks(snapshot, start, screen_ref);
+    }
+
+    // Shift+Enter 在曲目列表：将选中曲目追加到队列末尾；若队列为空则立即播放
+    void AppendTrackFromDetail(ScreenInteractive& screen_ref) {
+        network::Track tr;
+        {
+            const std::lock_guard<std::mutex> lock(tracks_mutex_);
+            if (open_playlist_tracks_.empty())
+                return;
+            const auto idx = static_cast<size_t>(selected_track_);
+            if (idx >= open_playlist_tracks_.size())
+                return;
+            tr = open_playlist_tracks_[idx];
+        }
+        std::string name = tr.name;
+        if (!tr.artist.empty())
+            name += " - " + tr.artist;
+        bool was_empty = false;
+        int new_idx = 0;
+        {
+            const std::lock_guard<std::mutex> lock(queue_mutex_);
+            was_empty = play_queue_.empty();
+            play_queue_.push_back(QueueEntry{tr.id, name});
+            new_idx = static_cast<int>(play_queue_.size()) - 1;
+        }
+        if (was_empty) {
+            PlayQueueAt(new_idx, screen_ref);
+        } else {
+            queue_status_ = "已加入队列: " + name;
+            screen_ref.PostEvent(ftxui::Event::Custom);
+        }
+    }
+
+    // ── 渲染方法 ──
+
+    // 歌单列表子视图（playlist_view_index_ == 0）
+    // 调用方须已持有 playlists_mutex_
+    auto BuildPlaylistListContent() -> Element {
+        Elements items;
+        items.push_back(text("我的歌单") | bold | center);
+        items.push_back(separator());
+        items.push_back(text(playlist_status_.empty() ? "请先登录" : playlist_status_) | dim);
+        if (!user_playlists_.empty()) {
+            items.push_back(separator());
+            for (size_t i = 0; i < user_playlists_.size(); ++i) {
+                auto row = text(playlist_display_names_[i]) | flex;
+                if (static_cast<int>(i) == selected_playlist_)
+                    row = row | inverted;
+                items.push_back(row);
+            }
+        }
+        items.push_back(filler());
+        items.push_back(separator());
+        items.push_back(text("Enter: 打开  Shift+Enter: 替换队列播放  r: 刷新") | dim);
+        return vbox(std::move(items)) | flex;
+    }
+
+    // 曲目列表子视图（playlist_view_index_ == 1）
+    // 调用方须已持有 tracks_mutex_
+    auto BuildTrackListContent() -> Element {
+        Elements items;
+        items.push_back(text(open_playlist_name_) | bold | center);
+        items.push_back(separator());
+        items.push_back(text(track_list_status_.empty() ? "正在加载..." : track_list_status_) |
+                        dim);
+        if (!track_display_names_.empty()) {
+            items.push_back(separator());
+            for (size_t i = 0; i < track_display_names_.size(); ++i) {
+                auto row = text(track_display_names_[i]) | flex;
+                if (static_cast<int>(i) == selected_track_)
+                    row = row | inverted;
+                items.push_back(row);
+            }
+        }
+        items.push_back(filler());
+        items.push_back(separator());
+        items.push_back(text("Enter: 播放  Shift+Enter: 加入队列  Esc: 返回") | dim);
+        return vbox(std::move(items)) | flex;
+    }
+
+    // 我的歌单页面入口：根据 playlist_view_index_ 分发到对应子视图
+    auto BuildMyPlaylistsContent() -> Element {
+        if (playlist_view_index_ == 1) {
+            const std::lock_guard<std::mutex> lock(tracks_mutex_);
+            return BuildTrackListContent();
+        }
+        const std::lock_guard<std::mutex> lock(playlists_mutex_);
+        return BuildPlaylistListContent();
+    }
+
+    // 使用系统默认编辑器打开配置文件    // 流程：
     //   1. 通过 WithRestoredIO 临时卸载 FTXUI 的终端钩子（raw mode / alt-screen）
     //   2. 在恢复后的普通终端中同步运行编辑器（vi/nano/gedit 等均可）
     //   3. 编辑器退出后，FTXUI 自动重新接管终端，TUI 继续运行
@@ -449,8 +889,8 @@ struct AppUi::Impl {
     }
 
     // 构建底部播放控制栏
-    // 播放/暂停时：状态图标 | 已播放时间 ████░░ 总时长 | 音量
-    // 其他状态：状态文字 + 音量
+    // 播放/暂停时：状态图标 | 已播放时间 ████░░ 总时长 | 队列信息 | 音量
+    // 其他状态：状态文字 + 队列信息 + 音量
     auto BuildPlayerBar() -> Element {
         const auto state = player.GetState();
         const auto vol_text = "音量: " + std::to_string(settings.volume) + "%";
@@ -464,25 +904,42 @@ struct AppUi::Impl {
                 (dur > 0) ? static_cast<float>(pos) / static_cast<float>(dur) : 0.0F;
             const auto state_icon = (state == player::PlayerState::kPlaying) ? "▶ " : "⏸ ";
 
-            return hbox({
-                       text(state_icon) | color(Color::Yellow),
-                       text(FormatTime(pos)) | dim,
-                       text(" "),
-                       gauge(ratio) | flex | color(Color::Cyan),
-                       text(" "),
-                       text(FormatTime(dur)) | dim,
-                       text("  "),
-                       text(vol_text) | dim,
-                   }) |
-                   border;
+            Elements bar;
+            bar.push_back(text(state_icon) | color(Color::Yellow));
+            bar.push_back(text(FormatTime(pos)) | dim);
+            bar.push_back(text(" "));
+            bar.push_back(gauge(ratio) | flex | color(Color::Cyan));
+            bar.push_back(text(" "));
+            bar.push_back(text(FormatTime(dur)) | dim);
+            bar.push_back(text("  "));
+            if (!queue_status_.empty()) {
+                bar.push_back(text(queue_status_) | color(Color::Green));
+                bar.push_back(text("  "));
+            }
+            bar.push_back(text(vol_text) | dim);
+            return hbox(std::move(bar)) | border;
         }
 
         if (state == player::PlayerState::kLoading) {
-            return hbox({text("⏳ 加载中") | dim | flex, text(vol_text) | dim}) | border;
+            Elements bar;
+            bar.push_back(text("⏳ 加载中") | dim | flex);
+            if (!queue_status_.empty()) {
+                bar.push_back(text(queue_status_) | color(Color::Green));
+                bar.push_back(text("  "));
+            }
+            bar.push_back(text(vol_text) | dim);
+            return hbox(std::move(bar)) | border;
         }
 
         // kStopped
-        return hbox({text("■ 停止") | dim | flex, text(vol_text) | dim}) | border;
+        Elements bar;
+        bar.push_back(text("■ 停止") | dim | flex);
+        if (!queue_status_.empty()) {
+            bar.push_back(text(queue_status_) | dim);
+            bar.push_back(text("  "));
+        }
+        bar.push_back(text(vol_text) | dim);
+        return hbox(std::move(bar)) | border;
     }
 };
 
@@ -497,8 +954,13 @@ auto AppUi::operator=(AppUi&&) noexcept -> AppUi& = default;
 void AppUi::Run() {
     // 注册登录状态变化时触发屏幕刷新的回调
     // 后台轮询线程每次更新状态时，通过 PostEvent(Custom) 唤醒 FTXUI 事件循环重绘界面
-    impl_->login_manager.SetOnStateChange(
-        [this] { impl_->screen.PostEvent(ftxui::Event::Custom); });
+    // 同时，当状态变为 kLoggedIn 时自动触发歌单加载
+    impl_->login_manager.SetOnStateChange([this] {
+        if (impl_->login_manager.GetState() == auth::LoginState::kLoggedIn) {
+            impl_->LoadUserPlaylists(impl_->screen);
+        }
+        impl_->screen.PostEvent(ftxui::Event::Custom);
+    });
 
     // 若配置文件中已有 cookies，启动异步校验（自动登录）
     // 回调已注册，状态变化时 UI 可正常刷新
@@ -530,7 +992,18 @@ void AppUi::Run() {
     // 占位页面：各自独立实例，避免同一 Component 被 Add 到同一容器多次
     auto placeholder_0 = Renderer([this] { return impl_->BuildPlaceholderContent(); });
     auto placeholder_1 = Renderer([this] { return impl_->BuildPlaceholderContent(); });
-    auto placeholder_2 = Renderer([this] { return impl_->BuildPlaceholderContent(); });
+
+    // 我的歌单页面：两层导航
+    //   - playlists_menu：歌单列表视图的上下键导航（维护 selected_playlist_）
+    //   - tracks_menu：曲目列表视图的上下键导航（维护 selected_track_）
+    //   - playlists_nav：Container::Tab 根据 playlist_view_index_ 决定哪个 Menu 获得焦点
+    // Renderer 包装后提供统一的自定义渲染（高亮、状态提示等）
+    auto playlists_menu = Menu(&impl_->playlist_display_names_, &impl_->selected_playlist_);
+    auto tracks_menu = Menu(&impl_->track_display_names_, &impl_->selected_track_);
+    auto playlists_nav =
+        Container::Tab({playlists_menu, tracks_menu}, &impl_->playlist_view_index_);
+    auto my_playlists_page =
+        Renderer(playlists_nav, [this] { return impl_->BuildMyPlaylistsContent(); });
 
     // 本地文件页面：local_menu 负责上下键导航（维护 selected_local_track），
     // fn 提供自定义文件列表渲染（高亮、状态提示等）
@@ -545,11 +1018,11 @@ void AppUi::Run() {
     // 右侧内容区域的组件容器（Tab 页由 selected_menu 索引控制）
     auto content_container = Container::Tab(
         {
-            placeholder_0,     // 0: 播放列表
-            placeholder_1,     // 1: 搜索
-            placeholder_2,     // 2: 我的收藏
-            local_files_page,  // 3: 本地文件（带 local_menu 交互）
-            settings_page,     // 4: 设置（带 settings_buttons 交互）
+            placeholder_0,      // 0: 播放列表
+            placeholder_1,      // 1: 搜索
+            my_playlists_page,  // 2: 我的歌单（带 playlists_menu 交互）
+            local_files_page,   // 3: 本地文件（带 local_menu 交互）
+            settings_page,      // 4: 设置（带 settings_buttons 交互）
         },
         &impl_->selected_menu);
 
@@ -579,26 +1052,70 @@ void AppUi::Run() {
     });
 
     // 添加全局快捷键处理
-    auto main_component = CatchEvent(renderer, [this](Event event) {
+    // Shift+Enter 在 Kitty 协议终端下产生 \x1b[13;2u
+    const Event kShiftEnter = Event::Special("\x1b[13;2u");
+    auto main_component = CatchEvent(renderer, [this, kShiftEnter](Event event) {
         // q 键退出程序
         if (event == Event::Character('q')) {
             impl_->screen.Exit();
             return true;
         }
 
-        // 本地文件页面的快捷键
+        // ── 全局：上下曲切换（任何页面均有效）──
+        if (event == Event::Character('[')) {
+            impl_->PlayPrevTrack(impl_->screen);
+            return true;
+        }
+        if (event == Event::Character(']')) {
+            impl_->PlayNextTrack(impl_->screen);
+            return true;
+        }
+
+        // ── 我的歌单页面 ──
+        if (impl_->selected_menu == 2) {
+            if (impl_->playlist_view_index_ == 0) {
+                // 歌单列表视图
+                if (event == Event::Return) {
+                    impl_->OpenPlaylistDetail(impl_->screen);
+                    return true;
+                }
+                if (event == kShiftEnter) {
+                    impl_->LoadAndReplaceQueue(impl_->screen);
+                    return true;
+                }
+                if (event == Event::Character('r')) {
+                    impl_->LoadUserPlaylists(impl_->screen);
+                    return true;
+                }
+            } else {
+                // 曲目列表视图
+                if (event == Event::Return) {
+                    impl_->PlayTrackFromDetail(impl_->screen);
+                    return true;
+                }
+                if (event == kShiftEnter) {
+                    impl_->AppendTrackFromDetail(impl_->screen);
+                    return true;
+                }
+                // Esc 返回歌单列表
+                if (event == Event::Escape) {
+                    impl_->playlist_view_index_ = 0;
+                    impl_->screen.PostEvent(ftxui::Event::Custom);
+                    return true;
+                }
+            }
+        }
+
+        // ── 本地文件页面 ──
         if (impl_->selected_menu == 3) {
-            // Enter 键播放选中曲目
             if (event == Event::Return) {
                 impl_->PlaySelectedTrack();
                 return true;
             }
-            // r 键刷新本地音乐库
             if (event == Event::Character('r')) {
                 impl_->RefreshLocalLibrary();
                 return true;
             }
-            // 空格键暂停/恢复
             if (event == Event::Character(' ')) {
                 const auto state = impl_->player.GetState();
                 if (state == player::PlayerState::kPlaying) {
@@ -608,16 +1125,14 @@ void AppUi::Run() {
                 }
                 return true;
             }
-            // s 键停止
             if (event == Event::Character('s')) {
                 impl_->player.Stop();
                 return true;
             }
         }
 
-        // 设置页面的快捷键
+        // ── 设置页面 ──
         if (impl_->selected_menu == 4) {
-            // e 键打开配置文件
             if (event == Event::Character('e')) {
                 impl_->OpenConfigFile();
                 return true;

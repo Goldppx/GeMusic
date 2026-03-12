@@ -1,5 +1,6 @@
 #include "gemusic/network/api_client.h"
 
+#include <cstdio>
 #include <iostream>
 
 #include <curl/curl.h>
@@ -259,6 +260,69 @@ struct ApiClient::Impl {
             pos = line_end + 2;  // 跳过 "\r\n"
         }
     }
+
+    // 将指定 URL 的内容下载到本地文件（直接使用绝对 URL，不拼接 base_url）
+    // 用于音频缓存：先下载到本地，再交由 miniaudio 播放本地路径
+    // 参数: url       - 完整的 HTTP/HTTPS 音频 CDN 地址
+    //        dest_path - 本地目标文件路径（父目录须已存在）
+    // 返回: 成功时返回 void，失败时返回 AppError
+    auto DoDownloadFile(std::string_view url, std::string_view dest_path)
+        -> std::expected<void, AppError> {
+        auto* curl = curl_easy_init();
+        if (curl == nullptr) {
+            return std::unexpected(AppError{ErrorCode::kNetworkError, "初始化 curl 失败"});
+        }
+
+        // 以二进制写模式创建目标文件
+        FILE* fp = std::fopen(std::string(dest_path).c_str(), "wb");
+        if (fp == nullptr) {
+            curl_easy_cleanup(curl);
+            return std::unexpected(
+                AppError{ErrorCode::kFileNotFound, "无法创建缓存文件: " + std::string(dest_path)});
+        }
+
+        // 设置请求 URL
+        curl_easy_setopt(curl, CURLOPT_URL, std::string(url).c_str());
+        // 默认写回调（CURLOPT_WRITEFUNCTION 未设置时）直接将数据写入 FILE*
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
+        // 跟随 CDN 重定向（网易云音频地址通常有一次 302）
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        // 网易云 CDN 要求 Referer，否则可能返回 403
+        curl_easy_setopt(curl, CURLOPT_REFERER, "https://music.163.com");
+        // 模拟 iOS 网易云客户端 User-Agent，与 Weapi 请求保持一致
+        curl_easy_setopt(
+            curl, CURLOPT_USERAGENT,
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 CloudMusic/0.1.1 NeteaseMusic");
+
+        spdlog::debug("DoDownloadFile: 开始下载 {} -> {}", url, dest_path);
+
+        const CURLcode res = curl_easy_perform(curl);
+        std::fclose(fp);
+
+        if (res != CURLE_OK) {
+            // 下载失败，删除不完整文件，避免下次误命中缓存
+            std::remove(std::string(dest_path).c_str());
+            curl_easy_cleanup(curl);
+            spdlog::error("DoDownloadFile: 下载失败 [{}]: {}", url, curl_easy_strerror(res));
+            return std::unexpected(AppError{ErrorCode::kNetworkError,
+                                            std::string("下载失败: ") + curl_easy_strerror(res)});
+        }
+
+        long status_code = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status_code);
+        curl_easy_cleanup(curl);
+
+        // HTTP 非 200 视为下载失败，同样删除不完整文件
+        if (status_code != 200) {
+            std::remove(std::string(dest_path).c_str());
+            return std::unexpected(AppError{ErrorCode::kNetworkError,
+                                            "下载失败，HTTP " + std::to_string(status_code)});
+        }
+
+        spdlog::info("DoDownloadFile: 下载完成 {} -> {}", url, dest_path);
+        return {};
+    }
 };
 
 ApiClient::ApiClient(std::string base_url, std::string cookies)
@@ -292,6 +356,11 @@ void ApiClient::AppendCookies(const std::string& response_cookies) {
 
 auto ApiClient::GetCookies() const -> const std::string& {
     return impl_->cookies;
+}
+
+auto ApiClient::DownloadFile(std::string_view url, std::string_view dest_path)
+    -> std::expected<void, AppError> {
+    return impl_->DoDownloadFile(url, dest_path);
 }
 
 }  // namespace gemusic::network

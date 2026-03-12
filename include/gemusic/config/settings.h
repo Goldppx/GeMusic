@@ -21,6 +21,9 @@ struct Settings {
     // 已登录的用户名（登录成功后由 LoginManager 写入）
     std::string user_name;
 
+    // 已登录用户的网易云数字 ID（登录成功后由 LoginManager 写入，用于调用歌单等 API）
+    int64_t user_id = 0;
+
     // 默认播放音量（0-100）
     int volume = 80;
 

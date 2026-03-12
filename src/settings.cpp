@@ -48,6 +48,9 @@ auto LoadSettings(std::string_view path) -> std::expected<Settings, AppError> {
         if (config["user_name"]) {
             settings.user_name = config["user_name"].as<std::string>();
         }
+        if (config["user_id"]) {
+            settings.user_id = config["user_id"].as<int64_t>();
+        }
         if (config["volume"]) {
             settings.volume = config["volume"].as<int>();
         }
@@ -77,6 +80,7 @@ auto SaveSettings(const Settings& settings, std::string_view path)
         out << YAML::Key << "api_base_url" << YAML::Value << settings.api_base_url;
         out << YAML::Key << "cookies" << YAML::Value << settings.cookies;
         out << YAML::Key << "user_name" << YAML::Value << settings.user_name;
+        out << YAML::Key << "user_id" << YAML::Value << settings.user_id;
         out << YAML::Key << "volume" << YAML::Value << settings.volume;
         out << YAML::Key << "cache_dir" << YAML::Value << settings.cache_dir;
         out << YAML::Key << "music_library_path" << YAML::Value << settings.music_library_path;
