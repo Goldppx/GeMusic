@@ -100,8 +100,12 @@ struct AppUi::Impl {
     }
 
     // 使用系统默认编辑器打开配置文件
+    // 流程：
+    //   1. 通过 WithRestoredIO 临时卸载 FTXUI 的终端钩子（raw mode / alt-screen）
+    //   2. 在恢复后的普通终端中同步运行编辑器（vi/nano/gedit 等均可）
+    //   3. 编辑器退出后，FTXUI 自动重新接管终端，TUI 继续运行
     void OpenConfigFile() {
-        // 获取用户偏好的编辑器，依次尝试 $EDITOR、$VISUAL、vi
+        // 优先使用用户偏好的终端编辑器，依次尝试 $EDITOR、$VISUAL、vi
         const char* editor = std::getenv("EDITOR");
         if (editor == nullptr) {
             editor = std::getenv("VISUAL");
@@ -110,13 +114,20 @@ struct AppUi::Impl {
             editor = "vi";
         }
 
-        // 构建命令
-        const std::string cmd = std::string(editor) + " " + config_path + " &";
+        const std::string editor_name = editor;
 
-        // 暂时退出 TUI，执行编辑器，完成后恢复
-        screen.Exit();
-        // 在退出循环后由 Run() 处理重新加载
-        open_config_status = "已使用 " + std::string(editor) + " 打开配置文件";
+        // 用双引号包裹配置文件路径，防止路径中含空格时命令解析出错
+        const std::string cmd = editor_name + " \"" + config_path + "\"";
+
+        // WithRestoredIO：将系统调用包装为一个 Closure，调用时 FTXUI 会：
+        //   - 先还原终端至普通模式（关闭 raw mode，退出 alt-screen）
+        //   - 执行 Closure（即阻塞运行编辑器）
+        //   - 编辑器退出后，重新进入 TUI 模式并刷新屏幕
+        screen.WithRestoredIO([cmd] {
+            std::system(cmd.c_str());  // NOLINT(concurrency-mt-unsafe)
+        })();
+
+        open_config_status = "已使用 " + editor_name + " 打开配置文件";
     }
 
     // 构建顶部标题栏
