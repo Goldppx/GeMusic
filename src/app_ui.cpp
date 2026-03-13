@@ -16,6 +16,7 @@
 #include "gemusic/auth/login_manager.h"
 #include "gemusic/config/settings.h"
 #include "gemusic/library/local_library.h"
+#include "gemusic/lyrics/lyrics_manager.h"
 #include "gemusic/network/api_client.h"
 #include "gemusic/network/netease_api.h"
 #include "gemusic/player/music_player.h"
@@ -168,6 +169,22 @@ struct AppUi::Impl {
     Component input_cookie;              // Cookie 输入框
     Component btn_confirm_cookie_login;  // [确认登录]（Cookie 表单）
     Component btn_cancel_cookie_form;    // [取消]（Cookie 表单）
+
+    // ── 歌词相关状态 ──
+    // 是否显示右侧歌词面板（按 l 键切换）
+    bool show_lyrics_ = false;
+    // 歌词面板宽度（字符列数）
+    int lyrics_panel_width_ = 35;
+    // 歌词面板可见区域的屏幕包围盒（reflect 写入，用于计算可见行数）
+    Box lyrics_area_box_;
+    // 歌词管理器：负责异步加载与查询
+    lyrics::LyricsManager lyrics_manager_;
+    // 歌词专用 HTTP 客户端（独立实例，避免与其他请求竞争）
+    network::ApiClient lyrics_api_client_{"", ""};
+    // 当前播放歌曲的网易云 ID（0 表示本地文件，不触发在线加载）
+    int64_t current_song_id_ = 0;
+    // 当前播放歌曲的本地文件路径（用于查找同名 .lrc 文件）
+    std::string current_song_local_path_;
 
     Impl(config::Settings& s, player::MusicPlayer& p, auth::LoginManager& lm, std::string cfg_path)
         : settings(s), player(p), login_manager(lm), config_path(std::move(cfg_path)) {
@@ -357,6 +374,13 @@ struct AppUi::Impl {
         queue_status_ = "♪ " + display_name + " (" + std::to_string(idx + 1) + "/" +
                         std::to_string(queue_size) + ")";
         screen_ref.PostEvent(ftxui::Event::Custom);
+
+        // 记录当前播放歌曲信息，并触发歌词加载
+        current_song_id_ = song_id;
+        current_song_local_path_ = local_path;
+        lyrics_api_client_.SetCookies(settings.cookies);
+        lyrics_manager_.LoadAsync(song_id, local_path, lyrics_api_client_,
+                                  [&screen_ref] { screen_ref.PostEvent(ftxui::Event::Custom); });
 
         // 本地文件模式：直接播放，无需后台下载
         if (!local_path.empty()) {
@@ -1119,6 +1143,107 @@ struct AppUi::Impl {
         scroll_top = std::max(0, std::min(scroll_top, std::max(0, total - visible_rows)));
     }
 
+    // 构建歌词面板内容（Element）
+    // 根据播放器当前位置自动滚动并高亮当前行：
+    //   - 当前行：Cyan 颜色 + "|> " 前缀
+    //   - 前后 3 行内的临近行：白色（normal）
+    //   - 更远的行：灰色（dim）
+    // 可见区域高度通过 lyrics_area_box_ 获取（reflect 写入）
+    auto BuildLyricsContent() -> Element {
+        // 获取播放器当前位置（毫秒）
+        const auto player_state = player.GetState();
+        uint32_t position_ms = 0;
+        if (player_state == player::PlayerState::kPlaying ||
+            player_state == player::PlayerState::kPaused) {
+            position_ms = player.GetTrackInfo().position_ms;
+        }
+
+        // 获取当前高亮行索引
+        const int cur_line = lyrics_manager_.GetCurrentLineIndex(position_ms);
+        const auto lines = lyrics_manager_.GetLines();
+        const int total_lines = static_cast<int>(lines.size());
+
+        // 计算可见区域行数（由 reflect(lyrics_area_box_) 写入）
+        const int visible_rows = std::max(1, lyrics_area_box_.y_max - lyrics_area_box_.y_min + 1);
+
+        // 自动滚动：将当前行保持在可见区域中央
+        int scroll_top = 0;
+        if (cur_line >= 0 && total_lines > 0) {
+            scroll_top = cur_line - visible_rows / 2;
+            scroll_top = std::max(0, std::min(scroll_top, std::max(0, total_lines - visible_rows)));
+        }
+
+        // 状态未加载时显示占位文字
+        const auto lyr_state = lyrics_manager_.GetState();
+        if (lyr_state == lyrics::LyricsState::kIdle) {
+            return vbox({
+                text("歌词") | bold | center,
+                separator(),
+                filler(),
+                text("暂无歌词") | dim | center,
+                filler(),
+            });
+        }
+        if (lyr_state == lyrics::LyricsState::kLoading) {
+            return vbox({
+                text("歌词") | bold | center,
+                separator(),
+                filler(),
+                text("加载中...") | dim | center,
+                filler(),
+            });
+        }
+        if (lyr_state == lyrics::LyricsState::kError || lines.empty()) {
+            return vbox({
+                text("歌词") | bold | center,
+                separator(),
+                filler(),
+                text("无歌词") | dim | center,
+                filler(),
+            });
+        }
+
+        // 渲染可见区域内的歌词行
+        Elements rows;
+        rows.push_back(text("歌词") | bold | center);
+        rows.push_back(separator());
+
+        const int end = std::min(scroll_top + visible_rows, total_lines);
+        for (int i = scroll_top; i < end; ++i) {
+            const auto& line = lines[static_cast<size_t>(i)];
+            const int dist = std::abs(i - cur_line);
+
+            Element row;
+            if (i == cur_line) {
+                // 当前行：Cyan 高亮 + "|> " 前缀指示符
+                row = hbox({
+                    text("|> ") | color(Color::Cyan),
+                    text(line.text) | color(Color::Cyan) | bold | flex,
+                });
+            } else if (dist <= 3) {
+                // 临近行（前后 3 行）：白色正常显示
+                row = hbox({
+                    text("   "),
+                    text(line.text) | flex,
+                });
+            } else {
+                // 远离行：灰色淡化
+                row = hbox({
+                    text("   "),
+                    text(line.text) | dim | flex,
+                });
+            }
+            rows.push_back(std::move(row));
+        }
+
+        // 若可见行少于可见区域高度，补充 filler
+        if (end - scroll_top < visible_rows) {
+            rows.push_back(filler());
+        }
+
+        return vbox(std::move(rows));
+    }
+
     // 创建内联样式的按钮（渲染为 "[label]" 形式的文字链接）
     // 聚焦时加粗并染青色，以区分当前焦点位置
     static auto MakeInlineButton(std::string label, std::function<void()> on_click) -> Component {
@@ -1713,7 +1838,19 @@ void AppUi::Run() {
         }
         return vbox({
             impl_->BuildTitleBar(),
-            split->Render() | flex,
+            // 根据 show_lyrics_ 决定是否在右侧追加歌词面板
+            // 歌词面板通过 reflect(lyrics_area_box_) 记录可见区域，供 BuildLyricsContent 计算滚动
+            [&]() -> Element {
+                if (impl_->show_lyrics_) {
+                    return hbox({
+                        split->Render() | flex,
+                        separator(),
+                        impl_->BuildLyricsContent() | reflect(impl_->lyrics_area_box_) |
+                            size(WIDTH, EQUAL, impl_->lyrics_panel_width_),
+                    });
+                }
+                return split->Render() | flex;
+            }(),
             impl_->BuildPlayerBar(seek_slider->Render() | flex | color(Color::Cyan)),
         });
     });
@@ -1730,6 +1867,13 @@ void AppUi::Run() {
         // q 键退出程序
         if (event == Event::Character('q')) {
             impl_->screen.Exit();
+            return true;
+        }
+
+        // ── 全局：切换歌词面板显示/隐藏（l 键）──
+        if (event == Event::Character('l')) {
+            impl_->show_lyrics_ = !impl_->show_lyrics_;
+            impl_->screen.PostEvent(ftxui::Event::Custom);
             return true;
         }
 

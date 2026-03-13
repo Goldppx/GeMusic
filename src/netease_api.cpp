@@ -211,4 +211,52 @@ auto FetchSongUrl(ApiClient& client, int64_t song_id) -> std::expected<std::stri
     return url_obj["url"].get<std::string>();
 }
 
+// 获取歌词的 Weapi 端点
+static constexpr std::string_view kSongLyricEndpoint = "https://music.163.com/weapi/song/lyric";
+
+auto FetchSongLyrics(ApiClient& client, int64_t song_id) -> std::expected<std::string, AppError> {
+    // 参数说明：lv=-1 请求最优质量歌词，kv=-1 Krc 格式，tv=-1 翻译歌词（不强制要求）
+    const nlohmann::json params = {
+        {"id", song_id},
+        {"lv", -1},
+        {"kv", -1},
+        {"tv", -1},
+    };
+
+    spdlog::debug("FetchSongLyrics: 请求歌曲 {} 的歌词", song_id);
+
+    auto result = client.PostWeapi(kSongLyricEndpoint, params);
+    if (!result) {
+        spdlog::warn("FetchSongLyrics: HTTP 请求失败: {}", result.error().message);
+        return std::unexpected(result.error());
+    }
+
+    const auto& resp = result.value();
+
+    // 校验业务响应码
+    if (!resp.json.is_object() || !resp.json.contains("code") ||
+        resp.json["code"].get<int>() != 200) {
+        const int code = resp.json.is_object() ? resp.json.value("code", -1) : -1;
+        spdlog::warn("FetchSongLyrics: 服务器返回异常 code={}", code);
+        return std::unexpected(AppError{ErrorCode::kNetworkError,
+                                        "获取歌词失败，服务器 code=" + std::to_string(code)});
+    }
+
+    // 解析 lrc.lyric 字段（纯文本 LRC 格式）
+    if (!resp.json.contains("lrc") || !resp.json["lrc"].is_object()) {
+        spdlog::info("FetchSongLyrics: 歌曲 {} 无歌词（缺少 lrc 字段）", song_id);
+        return std::string{};
+    }
+
+    const auto& lrc_obj = resp.json["lrc"];
+    if (!lrc_obj.contains("lyric") || !lrc_obj["lyric"].is_string()) {
+        spdlog::info("FetchSongLyrics: 歌曲 {} 无歌词（lrc.lyric 为空或非字符串）", song_id);
+        return std::string{};
+    }
+
+    const std::string lyric = lrc_obj["lyric"].get<std::string>();
+    spdlog::info("FetchSongLyrics: 歌曲 {} 歌词获取成功，长度 {} 字节", song_id, lyric.size());
+    return lyric;
+}
+
 }  // namespace gemusic::network

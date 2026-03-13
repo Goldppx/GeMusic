@@ -74,6 +74,14 @@ auto FetchPlaylistTracks(ApiClient& client, int64_t playlist_id)
 // 返回: 成功时返回播放 URL 或空字符串（不可用），失败时返回 AppError
 auto FetchSongUrl(ApiClient& client, int64_t song_id) -> std::expected<std::string, AppError>;
 
+// 获取指定歌曲的 LRC 格式歌词文本（需已登录）
+// 若歌曲无歌词，返回空字符串（非错误）
+// 参数:
+//   client  - 已配置 cookies 的 HTTP 客户端
+//   song_id - 歌曲数字 ID
+// 返回: 成功时返回 LRC 文本或空字符串（无歌词），失败时返回 AppError
+auto FetchSongLyrics(ApiClient& client, int64_t song_id) -> std::expected<std::string, AppError>;
+
 }  // namespace gemusic::network
 
 #endif  // GEMUSIC_NETWORK_NETEASE_API_H
