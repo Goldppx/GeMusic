@@ -1,7 +1,9 @@
 #include "gemusic/network/api_client.h"
 
+#include <atomic>
 #include <cstdio>
 #include <iostream>
+#include <mutex>
 
 #include <curl/curl.h>
 #include <spdlog/spdlog.h>
@@ -9,6 +11,35 @@
 #include "gemusic/network/netease_crypto.h"
 
 namespace gemusic::network {
+
+namespace {
+
+// 全局引用计数，保证 curl_global_init 只被调用一次，
+// curl_global_cleanup 只在最后一个 ApiClient 销毁时调用。
+std::mutex g_curl_init_mutex;
+int g_curl_init_ref_count = 0;
+
+// 增加引用计数，必要时执行 curl_global_init
+void CurlGlobalRef() {
+    std::lock_guard<std::mutex> lock(g_curl_init_mutex);
+    if (g_curl_init_ref_count == 0) {
+        curl_global_init(CURL_GLOBAL_DEFAULT);
+        spdlog::debug("curl_global_init 已执行");
+    }
+    ++g_curl_init_ref_count;
+}
+
+// 减少引用计数，计数归零时执行 curl_global_cleanup
+void CurlGlobalUnref() {
+    std::lock_guard<std::mutex> lock(g_curl_init_mutex);
+    --g_curl_init_ref_count;
+    if (g_curl_init_ref_count == 0) {
+        curl_global_cleanup();
+        spdlog::debug("curl_global_cleanup 已执行");
+    }
+}
+
+}  // namespace
 
 // libcurl 响应体写回调：将数据追加到 string 中
 static auto WriteBodyCallback(void* contents, size_t size, size_t nmemb, std::string* userp)
@@ -33,12 +64,13 @@ struct ApiClient::Impl {
     std::string cookies;
 
     Impl(std::string url, std::string ck) : base_url(std::move(url)), cookies(std::move(ck)) {
-        // 全局初始化 curl（整个程序生命周期只需一次）
-        curl_global_init(CURL_GLOBAL_DEFAULT);
+        // 通过引用计数保证 curl_global_init 只执行一次
+        CurlGlobalRef();
     }
 
     ~Impl() {
-        curl_global_cleanup();
+        // 通过引用计数保证 curl_global_cleanup 在最后一个实例销毁时执行
+        CurlGlobalUnref();
     }
 
     // 执行通用 HTTP 请求（GET 或 JSON POST）
@@ -145,8 +177,9 @@ struct ApiClient::Impl {
         // 开启 cookie 引擎（允许接收并存储 Set-Cookie）
         curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");
 
-        // 设置 POST 请求体
+        // 设置 POST 请求体及其长度（显式指定长度，避免含特殊字符时被截断）
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_body.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(post_body.size()));
 
         // 构建网易云要求的请求头
         // User-Agent 模拟 iOS 网易云客户端，以获取正确的响应

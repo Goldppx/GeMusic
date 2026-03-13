@@ -110,8 +110,30 @@ struct AppUi::Impl {
 
     // ── 鼠标点击命中检测用的条目包围盒 ──
     // 每帧渲染时由 reflect() 写入，供 CatchEvent 中的鼠标处理逻辑查询
-    std::vector<Box> playlist_item_boxes_;  // 歌单列表各条目的屏幕坐标范围
-    std::vector<Box> track_item_boxes_;     // 曲目列表各条目的屏幕坐标范围
+    // 手动滚动模式下，大小等于可见行数，索引为局部偏移（实际索引 = scroll_top + 局部索引）
+    std::vector<Box> playlist_item_boxes_;  // 歌单列表可见条目的屏幕坐标范围
+    std::vector<Box> track_item_boxes_;     // 曲目列表可见条目的屏幕坐标范围
+    std::vector<Box> queue_item_boxes_;     // 播放队列可见条目的屏幕坐标范围
+    std::vector<Box> local_item_boxes_;     // 本地文件可见条目的屏幕坐标范围
+
+    // ── 手动滚动状态 ──
+    // 各列表当前滚动偏移（可见区域第一行对应的全局索引）
+    int playlist_scroll_top_ = 0;
+    int track_scroll_top_ = 0;
+    int queue_scroll_top_ = 0;
+    int local_scroll_top_ = 0;
+
+    // 各列表可见区域的屏幕包围盒（flex + reflect 写入，用于计算可见行数）
+    Box playlist_list_area_box_;
+    Box track_list_area_box_;
+    Box queue_list_area_box_;
+    Box local_list_area_box_;
+
+    // 各列表的总条目数（render 时写入，CatchEvent 中读取用于 WheelDown 上界）
+    int playlist_total_ = 0;
+    int track_total_ = 0;
+    int queue_total_ = 0;
+    int local_total_ = 0;
 
     // ── 进度条拖拽状态 ──
     // 0-1000 归一化的进度位置（Slider 组件绑定变量）
@@ -646,26 +668,39 @@ struct AppUi::Impl {
 
     // 歌单列表子视图（playlist_view_index_ == 0）
     // 调用方须已持有 playlists_mutex_
-    // 选中项附加 focus 装饰器，配合 yframe 实现自动滚动
+    // 使用手动滚动：仅在选中项到达顶/底边缘时才移动视口，不做居中
     auto BuildPlaylistListContent() -> Element {
         Elements header;
         header.push_back(text("我的歌单") | bold | center);
         header.push_back(separator());
         header.push_back(text(playlist_status_.empty() ? "请先登录" : playlist_status_) | dim);
 
-        // 可滚动的歌单条目列表
+        // 记录总条目数，供 CatchEvent 中 WheelDown 上界使用
+        playlist_total_ = static_cast<int>(user_playlists_.size());
+
+        // 可见区域行数（由上一帧 reflect 写入的 Box 计算）
+        const int area_h = playlist_list_area_box_.y_max - playlist_list_area_box_.y_min + 1;
+        // 首帧 Box 未初始化（全 0 → area_h == 1），fallback 为显示全部
+        const int visible_rows = (area_h <= 2) ? playlist_total_ : area_h;
+
+        // 根据当前选中项调整滚动偏移
+        AdjustScroll(selected_playlist_, visible_rows, playlist_total_, playlist_scroll_top_);
+
+        // 可滚动的歌单条目列表（只渲染可见切片）
         Elements list_items;
         if (!user_playlists_.empty()) {
-            // 确保包围盒向量长度与歌单数量同步（用于鼠标点击命中检测）
-            playlist_item_boxes_.resize(user_playlists_.size());
-            for (size_t i = 0; i < user_playlists_.size(); ++i) {
-                // xflex：只横向伸展，保持高度 1 行；避免 yflex 导致条目占多行
-                // reflect：每帧渲染时将该条目的屏幕坐标写入 playlist_item_boxes_[i]，
-                //          供 CatchEvent 中鼠标点击检测使用
-                auto row =
-                    text(playlist_display_names_[i]) | xflex | reflect(playlist_item_boxes_[i]);
-                if (static_cast<int>(i) == selected_playlist_) {
-                    row = row | inverted | focus;
+            const int end = std::min(playlist_scroll_top_ + visible_rows, playlist_total_);
+            const int slice = end - playlist_scroll_top_;
+            // 确保包围盒向量长度与可见行数同步（局部索引）
+            playlist_item_boxes_.resize(static_cast<size_t>(slice));
+            for (int li = 0; li < slice; ++li) {
+                const int gi = playlist_scroll_top_ + li;  // 全局索引
+                // xflex：只横向伸展，保持高度 1 行
+                // reflect：将该条目的屏幕坐标写入 playlist_item_boxes_[li]（局部索引）
+                auto row = text(playlist_display_names_[static_cast<size_t>(gi)]) | xflex |
+                           reflect(playlist_item_boxes_[static_cast<size_t>(li)]);
+                if (gi == selected_playlist_) {
+                    row = row | inverted;
                 }
                 list_items.push_back(row);
             }
@@ -684,10 +719,11 @@ struct AppUi::Impl {
                    flex;
         }
 
+        // flex + reflect：分配剩余空间并记录实际高度，供下一帧计算可见行数
         return vbox({
                    vbox(std::move(header)),
                    separator(),
-                   vbox(std::move(list_items)) | yframe | vscroll_indicator | flex,
+                   vbox(std::move(list_items)) | flex | reflect(playlist_list_area_box_),
                    vbox(std::move(footer)),
                }) |
                flex;
@@ -695,7 +731,7 @@ struct AppUi::Impl {
 
     // 曲目列表子视图（playlist_view_index_ == 1）
     // 调用方须已持有 tracks_mutex_
-    // 选中项附加 focus 装饰器，配合 yframe 实现自动滚动
+    // 使用手动滚动：仅在选中项到达顶/底边缘时才移动视口，不做居中
     auto BuildTrackListContent() -> Element {
         Elements header;
         header.push_back(text(open_playlist_name_) | bold | center);
@@ -703,18 +739,32 @@ struct AppUi::Impl {
         header.push_back(text(track_list_status_.empty() ? "正在加载..." : track_list_status_) |
                          dim);
 
-        // 可滚动的曲目条目列表
+        // 记录总条目数，供 CatchEvent 中 WheelDown 上界使用
+        track_total_ = static_cast<int>(track_display_names_.size());
+
+        // 可见区域行数（由上一帧 reflect 写入的 Box 计算）
+        const int area_h = track_list_area_box_.y_max - track_list_area_box_.y_min + 1;
+        // 首帧 Box 未初始化（全 0 → area_h == 1），fallback 为显示全部
+        const int visible_rows = (area_h <= 2) ? track_total_ : area_h;
+
+        // 根据当前选中项调整滚动偏移
+        AdjustScroll(selected_track_, visible_rows, track_total_, track_scroll_top_);
+
+        // 可滚动的曲目条目列表（只渲染可见切片）
         Elements list_items;
         if (!track_display_names_.empty()) {
-            // 确保包围盒向量长度与曲目数量同步（用于鼠标点击命中检测）
-            track_item_boxes_.resize(track_display_names_.size());
-            for (size_t i = 0; i < track_display_names_.size(); ++i) {
-                // xflex：只横向伸展，保持高度 1 行；避免 yflex 导致条目占多行
-                // reflect：每帧渲染时将该条目的屏幕坐标写入 track_item_boxes_[i]，
-                //          供 CatchEvent 中鼠标点击检测使用
-                auto row = text(track_display_names_[i]) | xflex | reflect(track_item_boxes_[i]);
-                if (static_cast<int>(i) == selected_track_) {
-                    row = row | inverted | focus;
+            const int end = std::min(track_scroll_top_ + visible_rows, track_total_);
+            const int slice = end - track_scroll_top_;
+            // 确保包围盒向量长度与可见行数同步（局部索引）
+            track_item_boxes_.resize(static_cast<size_t>(slice));
+            for (int li = 0; li < slice; ++li) {
+                const int gi = track_scroll_top_ + li;  // 全局索引
+                // xflex：只横向伸展，保持高度 1 行
+                // reflect：将该条目的屏幕坐标写入 track_item_boxes_[li]（局部索引）
+                auto row = text(track_display_names_[static_cast<size_t>(gi)]) | xflex |
+                           reflect(track_item_boxes_[static_cast<size_t>(li)]);
+                if (gi == selected_track_) {
+                    row = row | inverted;
                 }
                 list_items.push_back(row);
             }
@@ -733,10 +783,11 @@ struct AppUi::Impl {
                    flex;
         }
 
+        // flex + reflect：分配剩余空间并记录实际高度，供下一帧计算可见行数
         return vbox({
                    vbox(std::move(header)),
                    separator(),
-                   vbox(std::move(list_items)) | yframe | vscroll_indicator | flex,
+                   vbox(std::move(list_items)) | flex | reflect(track_list_area_box_),
                    vbox(std::move(footer)),
                }) |
                flex;
@@ -754,7 +805,7 @@ struct AppUi::Impl {
 
     // 播放列表页面：展示当前播放队列
     // ♪ 标记正在播放的条目，高亮反显当前光标选中项（两者可不同）
-    // 选中项附加 focus 装饰器，配合 yframe 实现自动滚动
+    // 使用手动滚动：仅在选中项到达顶/底边缘时才移动视口，不做居中
     auto BuildQueueContent() -> Element {
         Elements header;
         header.push_back(text("播放列表") | bold | center);
@@ -776,20 +827,38 @@ struct AppUi::Impl {
             return vbox(std::move(items)) | flex;
         }
 
+        // 记录总条目数，供 CatchEvent 中 WheelDown 上界使用
+        queue_total_ = static_cast<int>(play_queue_.size());
+
         header.push_back(text("共 " + std::to_string(play_queue_.size()) + " 首") | dim);
         header.push_back(separator());
 
-        // 可滚动的条目列表
+        // 可见区域行数（由上一帧 reflect 写入的 Box 计算）
+        const int area_h = queue_list_area_box_.y_max - queue_list_area_box_.y_min + 1;
+        // 首帧 Box 未初始化（全 0 → area_h == 1），fallback 为显示全部
+        const int visible_rows = (area_h <= 2) ? queue_total_ : area_h;
+
+        // 根据当前选中项调整滚动偏移
+        AdjustScroll(selected_queue_track_, visible_rows, queue_total_, queue_scroll_top_);
+
+        // 可滚动的条目列表（只渲染可见切片）
         Elements list_items;
-        for (size_t i = 0; i < play_queue_.size(); ++i) {
-            const bool is_now_playing = (static_cast<int>(i) == current_queue_index_);
-            const bool is_selected = (static_cast<int>(i) == selected_queue_track_);
+        const int end = std::min(queue_scroll_top_ + visible_rows, queue_total_);
+        const int slice = end - queue_scroll_top_;
+        // 确保包围盒向量长度与可见行数同步（局部索引）
+        queue_item_boxes_.resize(static_cast<size_t>(slice));
+        for (int li = 0; li < slice; ++li) {
+            const int gi = queue_scroll_top_ + li;  // 全局索引
+            const bool is_now_playing = (gi == current_queue_index_);
+            const bool is_selected = (gi == selected_queue_track_);
 
             // 左侧图标：♪ 表示正在播放，空格占位保持对齐
             auto icon = text(is_now_playing ? "♪ " : "  ");
-            auto name = text(play_queue_[i].display_name) | flex;
+            auto name = text(play_queue_[static_cast<size_t>(gi)].display_name) | flex;
 
-            auto row = hbox({std::move(icon), std::move(name)});
+            // reflect：将该条目屏幕坐标写入 queue_item_boxes_[li]，供鼠标命中检测
+            auto row = hbox({std::move(icon), std::move(name)}) |
+                       reflect(queue_item_boxes_[static_cast<size_t>(li)]);
 
             if (is_selected && is_now_playing) {
                 // 光标与播放项重合：高亮 + 青色
@@ -801,10 +870,6 @@ struct AppUi::Impl {
                 row = row | color(Color::Green);
             }
 
-            // 选中项附加 focus，使 yframe 自动滚动到此处
-            if (is_selected) {
-                row = row | focus;
-            }
             list_items.push_back(row);
         }
 
@@ -813,9 +878,10 @@ struct AppUi::Impl {
         footer.push_back(separator());
         footer.push_back(text("Enter: 播放  d: 移除  [/]: 上/下一首") | dim);
 
+        // flex + reflect：分配剩余空间并记录实际高度，供下一帧计算可见行数
         return vbox({
                    vbox(std::move(header)),
-                   vbox(std::move(list_items)) | yframe | vscroll_indicator | flex,
+                   vbox(std::move(list_items)) | flex | reflect(queue_list_area_box_),
                    vbox(std::move(footer)),
                }) |
                flex;
@@ -906,7 +972,7 @@ struct AppUi::Impl {
     }
 
     // 本地文件页面内容
-    // 选中项附加 focus 装饰器，配合 yframe 实现自动滚动
+    // 使用手动滚动：仅在选中项到达顶/底边缘时才移动视口，不做居中
     auto BuildLocalFilesContent() -> Element {
         Elements header;
         header.push_back(
@@ -927,17 +993,35 @@ struct AppUi::Impl {
         header.push_back(text(local_scan_status) | dim);
         header.push_back(separator());
 
-        // 可滚动的文件列表
+        // 记录总条目数，供 CatchEvent 中 WheelDown 上界使用
+        local_total_ = static_cast<int>(local_tracks.size());
+
+        // 可见区域行数（由上一帧 reflect 写入的 Box 计算）
+        const int area_h = local_list_area_box_.y_max - local_list_area_box_.y_min + 1;
+        // 首帧 Box 未初始化（全 0 → area_h == 1），fallback 为显示全部
+        const int visible_rows = (area_h <= 2) ? local_total_ : area_h;
+
+        // 根据当前选中项调整滚动偏移
+        AdjustScroll(selected_local_track, visible_rows, local_total_, local_scroll_top_);
+
+        // 可滚动的文件列表（只渲染可见切片）
         Elements list_items;
-        for (size_t i = 0; i < local_tracks.size(); ++i) {
-            const auto& track = local_tracks[i];
+        const int end = std::min(local_scroll_top_ + visible_rows, local_total_);
+        const int slice = end - local_scroll_top_;
+        // 确保包围盒向量长度与可见行数同步（局部索引）
+        local_item_boxes_.resize(static_cast<size_t>(slice));
+        for (int li = 0; li < slice; ++li) {
+            const int gi = local_scroll_top_ + li;  // 全局索引
+            const auto& track = local_tracks[static_cast<size_t>(gi)];
+            // reflect：将该条目屏幕坐标写入 local_item_boxes_[li]，供鼠标命中检测
             auto line = hbox({
-                text(std::to_string(i + 1) + ". "),
-                text(track.file_name) | flex,
-                text(" [" + track.extension + "]") | dim,
-            });
-            if (static_cast<int>(i) == selected_local_track) {
-                line = line | inverted | focus;
+                            text(std::to_string(gi + 1) + ". "),
+                            text(track.file_name) | flex,
+                            text(" [" + track.extension + "]") | dim,
+                        }) |
+                        reflect(local_item_boxes_[static_cast<size_t>(li)]);
+            if (gi == selected_local_track) {
+                line = line | inverted;
             }
             list_items.push_back(line);
         }
@@ -947,9 +1031,10 @@ struct AppUi::Impl {
         footer.push_back(separator());
         footer.push_back(text("Enter: 替换并播放  a: 加入队列  r: 刷新") | dim);
 
+        // flex + reflect：分配剩余空间并记录实际高度，供下一帧计算可见行数
         return vbox({
                    vbox(std::move(header)),
-                   vbox(std::move(list_items)) | yframe | vscroll_indicator | flex,
+                   vbox(std::move(list_items)) | flex | reflect(local_list_area_box_),
                    vbox(std::move(footer)),
                }) |
                flex;
@@ -1011,6 +1096,27 @@ struct AppUi::Impl {
         }
 
         return vbox(std::move(rows)) | center;
+    }
+
+    // 手动滚动辅助方法：根据当前选中项调整 scroll_top，保证选中项在可见区域内
+    // 仅在选中项超出顶/底边缘时才更新偏移，不做居中处理
+    // selected     : 当前选中的全局索引
+    // visible_rows : 可见区域行数
+    // total        : 列表总条目数
+    // scroll_top   : [in/out] 当前滚动偏移，按需更新
+    static void AdjustScroll(int selected, int visible_rows, int total, int& scroll_top) {
+        if (total <= 0 || visible_rows <= 0)
+            return;
+        // 选中项超出底边缘时向下滚动
+        if (selected >= scroll_top + visible_rows) {
+            scroll_top = selected - visible_rows + 1;
+        }
+        // 选中项超出顶边缘时向上滚动
+        if (selected < scroll_top) {
+            scroll_top = selected;
+        }
+        // 限制 scroll_top 在合法范围内
+        scroll_top = std::max(0, std::min(scroll_top, std::max(0, total - visible_rows)));
     }
 
     // 创建内联样式的按钮（渲染为 "[label]" 形式的文字链接）
@@ -1701,6 +1807,32 @@ void AppUi::Run() {
                 impl_->RemoveFromQueue(impl_->selected_queue_track_, impl_->screen);
                 return true;
             }
+            // 鼠标事件：hover 高亮 + 滚轮滚动 + 单击播放
+            // queue_item_boxes_ 为局部索引，实际全局索引 = queue_scroll_top_ + 局部索引
+            if (event.is_mouse()) {
+                if (event.mouse().button == Mouse::WheelUp) {
+                    impl_->selected_queue_track_ = std::max(0, impl_->selected_queue_track_ - 1);
+                    return true;
+                }
+                if (event.mouse().button == Mouse::WheelDown) {
+                    impl_->selected_queue_track_ =
+                        std::min(impl_->queue_total_ - 1, impl_->selected_queue_track_ + 1);
+                    return true;
+                }
+                const int mx = event.mouse().x;
+                const int my = event.mouse().y;
+                for (size_t li = 0; li < impl_->queue_item_boxes_.size(); ++li) {
+                    if (impl_->queue_item_boxes_[li].Contain(mx, my)) {
+                        impl_->selected_queue_track_ =
+                            impl_->queue_scroll_top_ + static_cast<int>(li);
+                        if (event.mouse().button == Mouse::Left &&
+                            event.mouse().motion == Mouse::Released) {
+                            impl_->PlayQueueAt(impl_->selected_queue_track_, impl_->screen);
+                        }
+                        return true;
+                    }
+                }
+            }
         }
 
         // ── 我的歌单页面 ──
@@ -1711,24 +1843,37 @@ void AppUi::Run() {
                     impl_->OpenPlaylistDetail(impl_->screen);
                     return true;
                 }
-                // 鼠标左键单击：选中对应歌单并打开详情（等同 Enter）
-                // 利用 reflect() 在上一帧写入的包围盒做命中检测
-                // playlist_item_boxes_ 仅在 UI 线程读写，无需加锁
-                if (event.is_mouse() && event.mouse().button == Mouse::Left &&
-                    event.mouse().motion == Mouse::Released) {
-                    const int mx = event.mouse().x;
-                    const int my = event.mouse().y;
-                    for (size_t i = 0; i < impl_->playlist_item_boxes_.size(); ++i) {
-                        if (impl_->playlist_item_boxes_[i].Contain(mx, my)) {
-                            impl_->selected_playlist_ = static_cast<int>(i);
-                            impl_->OpenPlaylistDetail(impl_->screen);
-                            return true;
-                        }
-                    }
-                }
                 if (event == Event::Character('r')) {
                     impl_->LoadUserPlaylists(impl_->screen);
                     return true;
+                }
+                // 鼠标事件：hover 高亮 + 滚轮滚动 + 单击打开
+                // playlist_item_boxes_ 为局部索引，实际全局索引 = scroll_top + 局部索引
+                if (event.is_mouse()) {
+                    // 滚轮：移动选中项（手动滚动在 BuildPlaylistListContent 中跟进）
+                    if (event.mouse().button == Mouse::WheelUp) {
+                        impl_->selected_playlist_ = std::max(0, impl_->selected_playlist_ - 1);
+                        return true;
+                    }
+                    if (event.mouse().button == Mouse::WheelDown) {
+                        impl_->selected_playlist_ =
+                            std::min(impl_->playlist_total_ - 1, impl_->selected_playlist_ + 1);
+                        return true;
+                    }
+                    // 移动 / 点击：命中检测，更新高亮；左键松开时打开歌单
+                    const int mx = event.mouse().x;
+                    const int my = event.mouse().y;
+                    for (size_t li = 0; li < impl_->playlist_item_boxes_.size(); ++li) {
+                        if (impl_->playlist_item_boxes_[li].Contain(mx, my)) {
+                            impl_->selected_playlist_ =
+                                impl_->playlist_scroll_top_ + static_cast<int>(li);
+                            if (event.mouse().button == Mouse::Left &&
+                                event.mouse().motion == Mouse::Released) {
+                                impl_->OpenPlaylistDetail(impl_->screen);
+                            }
+                            return true;
+                        }
+                    }
                 }
             } else {
                 // 曲目列表视图
@@ -1736,20 +1881,6 @@ void AppUi::Run() {
                     // Enter：用当前歌单替换播放队列，从选中曲目开始播放
                     impl_->PlayTrackFromDetail(impl_->screen);
                     return true;
-                }
-                // 鼠标左键单击：选中对应曲目并播放（等同 Enter）
-                // track_item_boxes_ 仅在 UI 线程读写，无需加锁
-                if (event.is_mouse() && event.mouse().button == Mouse::Left &&
-                    event.mouse().motion == Mouse::Released) {
-                    const int mx = event.mouse().x;
-                    const int my = event.mouse().y;
-                    for (size_t i = 0; i < impl_->track_item_boxes_.size(); ++i) {
-                        if (impl_->track_item_boxes_[i].Contain(mx, my)) {
-                            impl_->selected_track_ = static_cast<int>(i);
-                            impl_->PlayTrackFromDetail(impl_->screen);
-                            return true;
-                        }
-                    }
                 }
                 if (event == Event::Character('a')) {
                     // a：将选中曲目加入播放队列
@@ -1766,6 +1897,32 @@ void AppUi::Run() {
                     impl_->playlist_view_index_ = 0;
                     impl_->screen.PostEvent(ftxui::Event::Custom);
                     return true;
+                }
+                // 鼠标事件：hover 高亮 + 滚轮滚动 + 单击播放
+                // track_item_boxes_ 为局部索引，实际全局索引 = scroll_top + 局部索引
+                if (event.is_mouse()) {
+                    if (event.mouse().button == Mouse::WheelUp) {
+                        impl_->selected_track_ = std::max(0, impl_->selected_track_ - 1);
+                        return true;
+                    }
+                    if (event.mouse().button == Mouse::WheelDown) {
+                        impl_->selected_track_ =
+                            std::min(impl_->track_total_ - 1, impl_->selected_track_ + 1);
+                        return true;
+                    }
+                    const int mx = event.mouse().x;
+                    const int my = event.mouse().y;
+                    for (size_t li = 0; li < impl_->track_item_boxes_.size(); ++li) {
+                        if (impl_->track_item_boxes_[li].Contain(mx, my)) {
+                            impl_->selected_track_ =
+                                impl_->track_scroll_top_ + static_cast<int>(li);
+                            if (event.mouse().button == Mouse::Left &&
+                                event.mouse().motion == Mouse::Released) {
+                                impl_->PlayTrackFromDetail(impl_->screen);
+                            }
+                            return true;
+                        }
+                    }
                 }
             }
         }
@@ -1785,6 +1942,32 @@ void AppUi::Run() {
             if (event == Event::Character('r')) {
                 impl_->RefreshLocalLibrary();
                 return true;
+            }
+            // 鼠标事件：hover 高亮 + 滚轮滚动 + 单击播放
+            // local_item_boxes_ 为局部索引，实际全局索引 = local_scroll_top_ + 局部索引
+            if (event.is_mouse()) {
+                if (event.mouse().button == Mouse::WheelUp) {
+                    impl_->selected_local_track = std::max(0, impl_->selected_local_track - 1);
+                    return true;
+                }
+                if (event.mouse().button == Mouse::WheelDown) {
+                    impl_->selected_local_track =
+                        std::min(impl_->local_total_ - 1, impl_->selected_local_track + 1);
+                    return true;
+                }
+                const int mx = event.mouse().x;
+                const int my = event.mouse().y;
+                for (size_t li = 0; li < impl_->local_item_boxes_.size(); ++li) {
+                    if (impl_->local_item_boxes_[li].Contain(mx, my)) {
+                        impl_->selected_local_track =
+                            impl_->local_scroll_top_ + static_cast<int>(li);
+                        if (event.mouse().button == Mouse::Left &&
+                            event.mouse().motion == Mouse::Released) {
+                            impl_->PlayLocalTrackFromList(impl_->screen);
+                        }
+                        return true;
+                    }
+                }
             }
         }
 
