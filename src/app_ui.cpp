@@ -1201,6 +1201,12 @@ struct AppUi::Impl {
 
         items.push_back(filler());
 
+        // ── 全局快捷键参考 ──
+        items.push_back(separator());
+        items.push_back(text("全局快捷键") | bold);
+        items.push_back(
+            text("Space: 播放/暂停  [/]: 上/下一首  +/-: 音量  </>: 快退/快进 10s  q: 退出") | dim);
+
         return vbox(std::move(items)) | flex;
     }
 
@@ -1497,6 +1503,50 @@ void AppUi::Run() {
         }
         if (event == Event::Character(']')) {
             impl_->PlayNextTrack(impl_->screen);
+            return true;
+        }
+
+        // ── 全局：播放/暂停 ──
+        if (event == Event::Character(' ')) {
+            const auto state = impl_->player.GetState();
+            if (state == player::PlayerState::kPlaying) {
+                impl_->player.Pause();
+            } else if (state == player::PlayerState::kPaused) {
+                impl_->player.Resume();
+            }
+            return true;
+        }
+
+        // ── 全局：音量调整（+/- 各 5%，+ 对应未按 Shift 时的 = 键）──
+        if (event == Event::Character('=') || event == Event::Character('+')) {
+            impl_->settings.volume = std::min(100, impl_->settings.volume + 5);
+            impl_->player.SetVolume(impl_->settings.volume);
+            return true;
+        }
+        if (event == Event::Character('-')) {
+            impl_->settings.volume = std::max(0, impl_->settings.volume - 5);
+            impl_->player.SetVolume(impl_->settings.volume);
+            return true;
+        }
+
+        // ── 全局：前后跳转 10 秒（<> 对应未按 Shift 时的 ,/. 键）──
+        if (event == Event::Character(',') || event == Event::Character('<')) {
+            const auto state = impl_->player.GetState();
+            if (state == player::PlayerState::kPlaying || state == player::PlayerState::kPaused) {
+                const auto& info = impl_->player.GetTrackInfo();
+                const uint32_t target =
+                    (info.position_ms >= 10000) ? (info.position_ms - 10000) : 0;
+                impl_->player.Seek(target);
+            }
+            return true;
+        }
+        if (event == Event::Character('.') || event == Event::Character('>')) {
+            const auto state = impl_->player.GetState();
+            if (state == player::PlayerState::kPlaying || state == player::PlayerState::kPaused) {
+                const auto& info = impl_->player.GetTrackInfo();
+                const uint32_t target = std::min(info.position_ms + 10000, info.duration_ms);
+                impl_->player.Seek(target);
+            }
             return true;
         }
 
