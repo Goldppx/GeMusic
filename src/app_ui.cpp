@@ -108,6 +108,17 @@ struct AppUi::Impl {
     // 供 FTXUI Menu 组件使用的队列条目显示名称列表（与 play_queue_ 保持同步）
     std::vector<std::string> queue_display_names_;
 
+    // ── 鼠标点击命中检测用的条目包围盒 ──
+    // 每帧渲染时由 reflect() 写入，供 CatchEvent 中的鼠标处理逻辑查询
+    std::vector<Box> playlist_item_boxes_;  // 歌单列表各条目的屏幕坐标范围
+    std::vector<Box> track_item_boxes_;     // 曲目列表各条目的屏幕坐标范围
+
+    // ── 进度条拖拽状态 ──
+    // 0-1000 归一化的进度位置（Slider 组件绑定变量）
+    int32_t seek_pos_ = 0;
+    // 最后一次用户手动 seek 的时间点（防止渲染回写覆盖拖拽中的值）
+    std::chrono::steady_clock::time_point last_seek_time_{};
+
     // 设置页面登录区的三个内联按钮（在 Run() 中初始化）
     // 渲染为 "[label]" 样式的可聚焦文字链接
     Component btn_scan_login;  // [扫码登录] — 触发 StartLogin()
@@ -217,6 +228,21 @@ struct AppUi::Impl {
     }
 
     // ── 歌单详情与播放队列相关方法 ──
+
+    // r 在曲目列表视图：强制刷新当前歌单曲目列表（清除缓存后重新请求）
+    // 通过将 open_playlist_id_ 置零绕过缓存检查，然后复用 OpenPlaylistDetail 的加载逻辑
+    void RefreshCurrentTrackList(ScreenInteractive& screen_ref) {
+        {
+            const std::lock_guard<std::mutex> lock(tracks_mutex_);
+            // 未打开任何歌单时无需刷新
+            if (open_playlist_id_ == 0)
+                return;
+            // 清除缓存 ID，使 OpenPlaylistDetail 跳过缓存检查并重新请求
+            open_playlist_id_ = 0;
+        }
+        // selected_playlist_ 仍指向当前歌单，OpenPlaylistDetail 会重新加载
+        OpenPlaylistDetail(screen_ref);
+    }
 
     // 打开选中歌单的曲目详情视图；若 ID 未变则使用缓存直接切换
     void OpenPlaylistDetail(ScreenInteractive& screen_ref) {
@@ -531,7 +557,7 @@ struct AppUi::Impl {
         ReplaceQueueWithTracks(snapshot, start, screen_ref);
     }
 
-    // Shift+Enter 在曲目列表：将选中曲目追加到队列末尾；若队列为空则立即播放
+    // a 在曲目列表：将选中曲目追加到队列末尾；若队列为空则立即播放
     void AppendTrackFromDetail(ScreenInteractive& screen_ref) {
         network::Track tr;
         {
@@ -590,7 +616,7 @@ struct AppUi::Impl {
         ReplaceQueueWithLocalTracks(local_tracks, start, screen_ref);
     }
 
-    // Shift+Enter 在本地文件页面：将选中本地文件追加到队列末尾；若队列为空则立即播放
+    // a 在本地文件页面：将选中本地文件追加到队列末尾；若队列为空则立即播放
     void AppendLocalTrackToQueue(ScreenInteractive& screen_ref) {
         if (local_tracks.empty())
             return;
@@ -630,8 +656,14 @@ struct AppUi::Impl {
         // 可滚动的歌单条目列表
         Elements list_items;
         if (!user_playlists_.empty()) {
+            // 确保包围盒向量长度与歌单数量同步（用于鼠标点击命中检测）
+            playlist_item_boxes_.resize(user_playlists_.size());
             for (size_t i = 0; i < user_playlists_.size(); ++i) {
-                auto row = text(playlist_display_names_[i]) | flex;
+                // xflex：只横向伸展，保持高度 1 行；避免 yflex 导致条目占多行
+                // reflect：每帧渲染时将该条目的屏幕坐标写入 playlist_item_boxes_[i]，
+                //          供 CatchEvent 中鼠标点击检测使用
+                auto row =
+                    text(playlist_display_names_[i]) | xflex | reflect(playlist_item_boxes_[i]);
                 if (static_cast<int>(i) == selected_playlist_) {
                     row = row | inverted | focus;
                 }
@@ -641,7 +673,7 @@ struct AppUi::Impl {
 
         Elements footer;
         footer.push_back(separator());
-        footer.push_back(text("Enter: 打开  Shift+Enter: 替换队列播放  r: 刷新") | dim);
+        footer.push_back(text("Enter: 打开  r: 刷新") | dim);
 
         if (list_items.empty()) {
             return vbox({
@@ -674,8 +706,13 @@ struct AppUi::Impl {
         // 可滚动的曲目条目列表
         Elements list_items;
         if (!track_display_names_.empty()) {
+            // 确保包围盒向量长度与曲目数量同步（用于鼠标点击命中检测）
+            track_item_boxes_.resize(track_display_names_.size());
             for (size_t i = 0; i < track_display_names_.size(); ++i) {
-                auto row = text(track_display_names_[i]) | flex;
+                // xflex：只横向伸展，保持高度 1 行；避免 yflex 导致条目占多行
+                // reflect：每帧渲染时将该条目的屏幕坐标写入 track_item_boxes_[i]，
+                //          供 CatchEvent 中鼠标点击检测使用
+                auto row = text(track_display_names_[i]) | xflex | reflect(track_item_boxes_[i]);
                 if (static_cast<int>(i) == selected_track_) {
                     row = row | inverted | focus;
                 }
@@ -685,7 +722,7 @@ struct AppUi::Impl {
 
         Elements footer;
         footer.push_back(separator());
-        footer.push_back(text("Enter: 播放  Shift+Enter: 加入队列  Esc: 返回") | dim);
+        footer.push_back(text("Enter: 替换并播放  a: 加入队列  r: 刷新  Esc: 返回") | dim);
 
         if (list_items.empty()) {
             return vbox({
@@ -731,10 +768,11 @@ struct AppUi::Impl {
             items.push_back(vbox(std::move(header)));
             items.push_back(filler());
             items.push_back(text("播放列表为空") | dim | center);
-            items.push_back(text("在「我的歌单」曲目列表中按 Enter 加载歌单") | dim | center);
+            items.push_back(text("在「我的歌单」或「本地文件」中按 Enter 替换并播放") | dim |
+                            center);
             items.push_back(filler());
             items.push_back(separator());
-            items.push_back(text("Enter/Shift+Enter: 跳播  d: 删除  [/]: 上/下一首") | dim);
+            items.push_back(text("Enter: 播放  d: 移除  [/]: 上/下一首") | dim);
             return vbox(std::move(items)) | flex;
         }
 
@@ -773,7 +811,7 @@ struct AppUi::Impl {
         // 底部固定提示栏
         Elements footer;
         footer.push_back(separator());
-        footer.push_back(text("Enter/Shift+Enter: 跳播  d: 删除  [/]: 上/下一首") | dim);
+        footer.push_back(text("Enter: 播放  d: 移除  [/]: 上/下一首") | dim);
 
         return vbox({
                    vbox(std::move(header)),
@@ -822,11 +860,13 @@ struct AppUi::Impl {
             (state == player::PlayerState::kPlaying || state == player::PlayerState::kPaused);
 
         if (!has_track) {
-            return hbox({
-                       text("GeMusic") | bold | color(Color::Cyan),
-                       text(" - 终端音乐播放器") | dim,
-                   }) |
-                   border;
+            return vbox({
+                hbox({
+                    text("GeMusic") | bold | color(Color::Cyan),
+                    text(" - 终端音乐播放器") | dim,
+                }),
+                separator(),
+            });
         }
 
         const auto& info = player.GetTrackInfo();
@@ -842,7 +882,7 @@ struct AppUi::Impl {
         items.push_back(text("  "));
         items.push_back(text(state_icon) | color(Color::Yellow));
 
-        return hbox(std::move(items)) | border;
+        return vbox({hbox(std::move(items)), separator()});
     }
 
     // 构建左侧菜单面板
@@ -880,7 +920,7 @@ struct AppUi::Impl {
                             dim);
             items.push_back(filler());
             items.push_back(separator());
-            items.push_back(text("Enter: 播放  Shift+Enter: 加入队列  r: 刷新") | dim);
+            items.push_back(text("Enter: 替换并播放  a: 加入队列  r: 刷新") | dim);
             return vbox(std::move(items)) | flex;
         }
 
@@ -905,7 +945,7 @@ struct AppUi::Impl {
         // 底部操作提示
         Elements footer;
         footer.push_back(separator());
-        footer.push_back(text("Enter: 播放  Shift+Enter: 加入队列  r: 刷新") | dim);
+        footer.push_back(text("Enter: 替换并播放  a: 加入队列  r: 刷新") | dim);
 
         return vbox({
                    vbox(std::move(header)),
@@ -1194,18 +1234,19 @@ struct AppUi::Impl {
 
         items.push_back(separator());
         items.push_back(text("e: 用编辑器打开配置文件") | dim);
+        // 空行分隔
+        items.push_back(text(""));
+
+        // ── 全局快捷键参考（紧接配置文件提示后）──
+        items.push_back(text("全局快捷键") | bold);
+        items.push_back(
+            text("Space: 播放/暂停  [/]: 上/下一首  +/-: 音量  </>: 快退/快进 10s  q: 退出") | dim);
 
         if (!open_config_status.empty()) {
             items.push_back(text(open_config_status) | color(Color::Yellow));
         }
 
         items.push_back(filler());
-
-        // ── 全局快捷键参考 ──
-        items.push_back(separator());
-        items.push_back(text("全局快捷键") | bold);
-        items.push_back(
-            text("Space: 播放/暂停  [/]: 上/下一首  +/-: 音量  </>: 快退/快进 10s  q: 退出") | dim);
 
         return vbox(std::move(items)) | flex;
     }
@@ -1222,7 +1263,8 @@ struct AppUi::Impl {
     // 构建底部播放控制栏
     // 播放/暂停时：状态图标 | 已播放时间 ████░░ 总时长 | 队列信息 | 音量
     // 其他状态：状态文字 + 队列信息 + 音量
-    auto BuildPlayerBar() -> Element {
+    // seek_elem：外部传入的可交互进度条组件渲染结果（仅播放/暂停状态使用）
+    auto BuildPlayerBar(Element seek_elem) -> Element {
         const auto state = player.GetState();
         const auto vol_text = "音量: " + std::to_string(settings.volume) + "%";
 
@@ -1230,16 +1272,14 @@ struct AppUi::Impl {
             const auto& info = player.GetTrackInfo();
             const uint32_t pos = info.position_ms;
             const uint32_t dur = info.duration_ms;
-            // 计算进度比例（防止除零；dur 为 0 时显示空进度条）
-            const float ratio =
-                (dur > 0) ? static_cast<float>(pos) / static_cast<float>(dur) : 0.0F;
             const auto state_icon = (state == player::PlayerState::kPlaying) ? "▶ " : "⏸ ";
 
             Elements bar;
             bar.push_back(text(state_icon) | color(Color::Yellow));
             bar.push_back(text(FormatTime(pos)) | dim);
             bar.push_back(text(" "));
-            bar.push_back(gauge(ratio) | flex | color(Color::Cyan));
+            // 使用外部传入的可交互 Slider 替换原来的只读 gauge
+            bar.push_back(std::move(seek_elem));
             bar.push_back(text(" "));
             bar.push_back(text(FormatTime(dur)) | dim);
             bar.push_back(text("  "));
@@ -1380,12 +1420,34 @@ void AppUi::Run() {
     });
 
     // Tab=0：正常按钮行（扫码登录、账密登录、Cookie登录、刷新、退出登录）
+    // 用 Maybe 包装各按钮，只在对应登录状态下才允许聚焦和接收事件，
+    // 避免方向键移动到当前状态下不可见的按钮上。
+    //
+    // 可见规则：
+    //   btn_scan_login / btn_password_login / btn_cookie_login：
+    //     未登录（非 kLoggedIn、非 kFetchingKey）时显示
+    //   btn_refresh：
+    //     等待扫码/确认 和 正在获取 key 期间隐藏，其余均显示
+    //   btn_logout：
+    //     仅 kLoggedIn 时显示
+    auto show_login_btns = [this] {
+        const auto s = impl_->login_manager.GetState();
+        return s != auth::LoginState::kLoggedIn && s != auth::LoginState::kFetchingKey;
+    };
+    auto show_refresh = [this] {
+        const auto s = impl_->login_manager.GetState();
+        return s != auth::LoginState::kWaitingScan && s != auth::LoginState::kWaitingConfirm &&
+               s != auth::LoginState::kFetchingKey;
+    };
+    auto show_logout = [this] {
+        return impl_->login_manager.GetState() == auth::LoginState::kLoggedIn;
+    };
     auto normal_buttons = Container::Horizontal({
-        impl_->btn_scan_login,
-        impl_->btn_password_login,
-        impl_->btn_cookie_login,
-        impl_->btn_refresh,
-        impl_->btn_logout,
+        Maybe(impl_->btn_scan_login, show_login_btns),
+        Maybe(impl_->btn_password_login, show_login_btns),
+        Maybe(impl_->btn_cookie_login, show_login_btns),
+        Maybe(impl_->btn_refresh, show_refresh),
+        Maybe(impl_->btn_logout, show_logout),
     });
     // Tab=1：账密登录表单（手机号输入框、密码输入框、确认/取消按钮）
     auto form_container = Container::Vertical({
@@ -1454,35 +1516,104 @@ void AppUi::Run() {
         },
         &impl_->selected_menu);
 
-    // 左右布局容器
-    auto main_container = Container::Horizontal({menu, content_container});
+    // 侧边栏初始宽度（字符数，含左右各 1 字符的边框），用户可用鼠标拖拽分割线实时调整
+    int sidebar_width = 20;
 
-    // 使用 Renderer 将组件与整体布局组合
+    // 为左侧菜单套上边框，作为 ResizableSplitLeft 的 main 面板
+    auto menu_panel =
+        Renderer(menu, [&menu] { return menu->Render() | vscroll_indicator | frame | border; });
+
+    // 为右侧内容区套上边框，作为 ResizableSplitLeft 的 back 面板
+    auto content_panel = Renderer(
+        content_container, [&content_container] { return content_container->Render() | border; });
+
+    // ResizableSplitLeft：
+    //   - main（左侧菜单）宽度由 sidebar_width 控制
+    //   - back（右侧内容）自动填满剩余宽度
+    //   - 分割线可用鼠标左键按住拖拽来调整两侧比例
+    //   - 键盘焦点链保持不变（menu_panel → content_panel 顺序）
     // 整体布局结构：
     //   ┌──────────────────────────────┐
     //   │         标题栏               │
-    //   ├──────┬───────────────────────┤
-    //   │ 菜单 │      内容区域         │
-    //   ├──────┴───────────────────────┤
-    //   │       播放控制栏             │
+    //   ├──────┬──────────────────────┤
+    //   │ 菜单 │      内容区域        │
+    //   ├──────┴──────────────────────┤
+    //   │       播放控制栏            │
     //   └──────────────────────────────┘
-    // 调用 content_container->Render() 而非 BuildContent()，
-    // 确保渲染链从根组件发起，焦点状态能正确传递至各子组件
-    auto renderer = Renderer(main_container, [this, &menu, &content_container] {
+    //   分割线使用 separatorEmpty（不可见），鼠标仍可在边界处拖拽调整宽度
+    ResizableSplitOption split_options;
+    split_options.main = menu_panel;
+    split_options.back = content_panel;
+    split_options.direction = Direction::Left;
+    split_options.main_size = &sidebar_width;
+    split_options.separator_func = [] { return separatorEmpty(); };
+    auto split = ResizableSplit(split_options);
+
+    // 创建可拖拽进度条组件
+    // 使用 0-1000 归一化范围（避免 duration_ms 变化导致 max 动态改变的问题）
+    // color_inactive = Cyan：未聚焦时与原 gauge 颜色保持一致
+    // color_active   = White：聚焦/交互时高亮提示用户可操作
+    // on_change：将 0-1000 映射回毫秒后调用 player.Seek()，并记录 seek 时间
+    //            防止渲染线程在 500ms 内将 seek_pos_ 回写为播放器实际位置
+    SliderOption<int32_t> seek_opt;
+    seek_opt.value = &impl_->seek_pos_;
+    seek_opt.min = 0;
+    seek_opt.max = 1000;
+    seek_opt.increment = 10;
+    seek_opt.color_active = Color::White;
+    seek_opt.color_inactive = Color::Cyan;
+    seek_opt.on_change = [this] {
+        const auto& info = impl_->player.GetTrackInfo();
+        if (info.duration_ms > 0) {
+            // 将 0-1000 的归一化值映射回实际毫秒位置
+            const uint32_t target_ms =
+                static_cast<uint32_t>(impl_->seek_pos_) * info.duration_ms / 1000;
+            impl_->player.Seek(target_ms);
+            impl_->last_seek_time_ = std::chrono::steady_clock::now();
+        }
+    };
+    auto seek_slider = Slider(seek_opt);
+
+    // 用 Maybe 包装 seek_slider，仅在播放或暂停时允许聚焦/接收事件
+    // 这样在 kStopped / kLoading 状态下，Tab 键不会停在进度条上
+    // 注意：渲染时仍直接调用 seek_slider->Render()，不通过 Maybe，
+    // 以确保 reflect(gauge_box_) 在播放时能正确追踪屏幕位置
+    auto show_seek = [this] {
+        const auto s = impl_->player.GetState();
+        return s == player::PlayerState::kPlaying || s == player::PlayerState::kPaused;
+    };
+    auto seek_slider_maybe = Maybe(seek_slider, show_seek);
+
+    // 将 split 与 seek_slider_maybe 放入同一 Container，确保两者都能接收到鼠标事件
+    // ComponentBase::OnEvent 对鼠标事件广播给所有子组件，seek_slider 通过
+    // reflect(gauge_box_) 追踪自身屏幕位置，只响应落在进度条区域内的点击/拖拽
+    auto main_layout = Container::Vertical({split, seek_slider_maybe});
+
+    // 通过 main_layout 确保渲染链从根组件发起，焦点状态能正确传递至各子组件
+    auto renderer = Renderer(main_layout, [this, &split, seek_slider] {
+        // 同步播放进度到 seek_pos_（0-1000）
+        // seek 后 500ms 内不覆盖，避免拖拽时进度条被渲染线程跳回
+        const auto state = impl_->player.GetState();
+        if (state == player::PlayerState::kPlaying || state == player::PlayerState::kPaused) {
+            const auto& info = impl_->player.GetTrackInfo();
+            const auto now = std::chrono::steady_clock::now();
+            const auto since_seek_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - impl_->last_seek_time_)
+                    .count();
+            if (since_seek_ms > 500 && info.duration_ms > 0) {
+                impl_->seek_pos_ = static_cast<int32_t>(info.position_ms) * 1000 /
+                                   static_cast<int32_t>(info.duration_ms);
+            }
+        }
         return vbox({
             impl_->BuildTitleBar(),
-            hbox({
-                menu->Render() | vscroll_indicator | frame | size(WIDTH, EQUAL, 20) | border,
-                content_container->Render() | flex | border,
-            }) | flex,
-            impl_->BuildPlayerBar(),
+            split->Render() | flex,
+            impl_->BuildPlayerBar(seek_slider->Render() | flex | color(Color::Cyan)),
         });
     });
 
     // 添加全局快捷键处理
-    // Shift+Enter 在 Kitty 协议终端下产生 \x1b[13;2u
-    const Event kShiftEnter = Event::Special("\x1b[13;2u");
-    auto main_component = CatchEvent(renderer, [this, kShiftEnter](Event event) {
+    auto main_component = CatchEvent(renderer, [this](Event event) {
         // 当登录表单处于激活状态时（账密表单或 Cookie 表单），
         // 所有字符键事件直接传递给输入框处理，
         // 避免 q/e/[/] 等全局快捷键在用户输入时意外触发
@@ -1552,8 +1683,8 @@ void AppUi::Run() {
 
         // ── 播放列表页面（当前播放队列）──
         if (impl_->selected_menu == 0) {
-            if (event == Event::Return || event == kShiftEnter) {
-                // Enter / Shift+Enter：跳转并播放选中条目
+            if (event == Event::Return) {
+                // Enter：播放选中条目
                 int idx = impl_->selected_queue_track_;
                 bool valid = false;
                 {
@@ -1566,7 +1697,7 @@ void AppUi::Run() {
                 return true;
             }
             if (event == Event::Character('d')) {
-                // d：删除选中条目
+                // d：从队列移除选中条目
                 impl_->RemoveFromQueue(impl_->selected_queue_track_, impl_->screen);
                 return true;
             }
@@ -1580,9 +1711,20 @@ void AppUi::Run() {
                     impl_->OpenPlaylistDetail(impl_->screen);
                     return true;
                 }
-                if (event == kShiftEnter) {
-                    impl_->LoadAndReplaceQueue(impl_->screen);
-                    return true;
+                // 鼠标左键单击：选中对应歌单并打开详情（等同 Enter）
+                // 利用 reflect() 在上一帧写入的包围盒做命中检测
+                // playlist_item_boxes_ 仅在 UI 线程读写，无需加锁
+                if (event.is_mouse() && event.mouse().button == Mouse::Left &&
+                    event.mouse().motion == Mouse::Released) {
+                    const int mx = event.mouse().x;
+                    const int my = event.mouse().y;
+                    for (size_t i = 0; i < impl_->playlist_item_boxes_.size(); ++i) {
+                        if (impl_->playlist_item_boxes_[i].Contain(mx, my)) {
+                            impl_->selected_playlist_ = static_cast<int>(i);
+                            impl_->OpenPlaylistDetail(impl_->screen);
+                            return true;
+                        }
+                    }
                 }
                 if (event == Event::Character('r')) {
                     impl_->LoadUserPlaylists(impl_->screen);
@@ -1591,11 +1733,32 @@ void AppUi::Run() {
             } else {
                 // 曲目列表视图
                 if (event == Event::Return) {
+                    // Enter：用当前歌单替换播放队列，从选中曲目开始播放
                     impl_->PlayTrackFromDetail(impl_->screen);
                     return true;
                 }
-                if (event == kShiftEnter) {
+                // 鼠标左键单击：选中对应曲目并播放（等同 Enter）
+                // track_item_boxes_ 仅在 UI 线程读写，无需加锁
+                if (event.is_mouse() && event.mouse().button == Mouse::Left &&
+                    event.mouse().motion == Mouse::Released) {
+                    const int mx = event.mouse().x;
+                    const int my = event.mouse().y;
+                    for (size_t i = 0; i < impl_->track_item_boxes_.size(); ++i) {
+                        if (impl_->track_item_boxes_[i].Contain(mx, my)) {
+                            impl_->selected_track_ = static_cast<int>(i);
+                            impl_->PlayTrackFromDetail(impl_->screen);
+                            return true;
+                        }
+                    }
+                }
+                if (event == Event::Character('a')) {
+                    // a：将选中曲目加入播放队列
                     impl_->AppendTrackFromDetail(impl_->screen);
+                    return true;
+                }
+                if (event == Event::Character('r')) {
+                    // r：刷新当前歌单曲目列表
+                    impl_->RefreshCurrentTrackList(impl_->screen);
                     return true;
                 }
                 // Esc 返回歌单列表
@@ -1614,8 +1777,8 @@ void AppUi::Run() {
                 impl_->PlayLocalTrackFromList(impl_->screen);
                 return true;
             }
-            // Shift+Enter：将选中本地文件追加到队列末尾
-            if (event == kShiftEnter) {
+            // a：将选中本地文件加入播放队列
+            if (event == Event::Character('a')) {
                 impl_->AppendLocalTrackToQueue(impl_->screen);
                 return true;
             }
