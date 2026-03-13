@@ -508,6 +508,52 @@ struct LoginManager::Impl {
                  msg.empty() ? ("登录失败，错误码: " + std::to_string(code)) : msg);
     }
 
+    // Cookie 登录流程（在后台线程中运行）
+    // 用户提供的完整 Cookie 字符串（须包含 MUSIC_U）直接设置到 api_client，
+    // 调用账户接口校验有效性：
+    //   - code==200 → Cookie 有效，走 OnLoginSuccess() 完成登录
+    //   - 非 200    → Cookie 无效，清除并回到 kError
+    //   - 网络错误  → 回到 kError，保留输入的 Cookie 供重试
+    void DoCookieLogin(const std::string& cookie) {
+        SetState(LoginState::kVerifying, "正在验证 Cookie...");
+
+        // 将用户提供的 Cookie 设置到 api_client
+        api_client.SetCookies(cookie);
+
+        // 注入设备 Cookie（sDeviceId、deviceId 等），与其它登录方式保持一致
+        InjectDeviceCookies();
+
+        auto result = api_client.PostWeapi(kAccountEndpoint, nlohmann::json::object());
+
+        if (stop_flag.load()) {
+            return;
+        }
+
+        if (!result) {
+            // 网络层错误
+            SetState(LoginState::kError, "Cookie 验证失败: " + result.error().message);
+            return;
+        }
+
+        const auto& resp = result.value();
+        const bool cookie_valid = resp.json.is_object() && resp.json.contains("code") &&
+                                  resp.json["code"].get<int>() == 200;
+
+        if (!cookie_valid) {
+            const int code = resp.json.is_object() ? resp.json.value("code", -1) : -1;
+            spdlog::warn("Cookie 登录失败，code={}", code);
+            // Cookie 无效，清除已设置的 Cookie
+            api_client.SetCookies("");
+            SetState(LoginState::kError,
+                     "Cookie 无效（code=" + std::to_string(code) + "），请检查后重试");
+            return;
+        }
+
+        // Cookie 有效，走统一的登录成功处理路径
+        spdlog::info("Cookie 登录成功");
+        OnLoginSuccess();
+    }
+
     // 自动登录流程：使用已保存的 cookies 校验登录状态（在后台线程中运行）
     //   - API 返回 code==200 → 登录有效，进入 kLoggedIn
     //   - API 返回非 200（cookies 过期/失效）→ 清除 cookies，进入 kIdle
@@ -661,6 +707,25 @@ void LoginManager::StartPasswordLogin(std::string phone, std::string password) {
     // 在后台线程中发起账密登录请求
     impl_->poll_thread = std::thread(
         [this, p = std::move(phone), pw = std::move(password)] { impl_->DoPasswordLogin(p, pw); });
+}
+
+void LoginManager::StartCookieLogin(std::string cookie) {
+    // 停止当前可能正在运行的后台线程
+    impl_->stop_flag.store(true);
+    if (impl_->poll_thread.joinable()) {
+        impl_->poll_thread.join();
+    }
+
+    // 重置停止标志，清空二维码数据（与扫码流程互斥）
+    impl_->stop_flag.store(false);
+    {
+        const std::lock_guard<std::mutex> lock(impl_->qr_mutex);
+        impl_->qr_matrix.clear();
+        impl_->qr_url.clear();
+    }
+
+    // 在后台线程中发起 Cookie 登录校验
+    impl_->poll_thread = std::thread([this, ck = std::move(cookie)] { impl_->DoCookieLogin(ck); });
 }
 
 void LoginManager::TryAutoLogin() {

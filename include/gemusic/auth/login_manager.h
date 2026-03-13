@@ -70,6 +70,12 @@ class LoginManager {
     // password - 明文密码（内部 MD5 后发送）
     void StartPasswordLogin(std::string phone, std::string password);
 
+    // Cookie 登录（异步，立即返回）
+    // 用户从浏览器中复制完整的 Cookie 字符串（须包含 MUSIC_U），
+    // 内部设置到 api_client 后调用账户接口校验有效性，
+    // 成功则提取用户名并持久化，失败则回到 kIdle 并展示错误信息
+    void StartCookieLogin(std::string cookie);
+
     // 替换状态变化回调（在 AppUi::Run() 启动后调用，注册屏幕刷新函数）
     void SetOnStateChange(std::function<void()> callback);
 

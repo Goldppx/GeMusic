@@ -89,10 +89,11 @@ struct AppUi::Impl {
     mutable std::mutex tracks_mutex_;
 
     // ── 播放队列状态 ──
-    // 播放队列条目（歌曲 ID + 显示名称）
+    // 播放队列条目（歌曲 ID + 显示名称 + 可选本地路径）
     struct QueueEntry {
         int64_t song_id;
         std::string display_name;
+        std::string local_path;  // 非空时直接播放本地文件，跳过网络请求
     };
     // 当前播放队列
     std::vector<QueueEntry> play_queue_;
@@ -127,6 +128,14 @@ struct AppUi::Impl {
     Component btn_confirm_login;   // [确认登录]
     Component btn_cancel_form;     // [取消]
 
+    // ── Cookie 登录表单状态 ──
+    // password_form_tab_ == 2 时显示 Cookie 登录表单
+    std::string cookie_input_value_;     // Cookie 输入框绑定值
+    Component btn_cookie_login;          // [Cookie登录] — 切换至 Cookie 登录表单
+    Component input_cookie;              // Cookie 输入框
+    Component btn_confirm_cookie_login;  // [确认登录]（Cookie 表单）
+    Component btn_cancel_cookie_form;    // [取消]（Cookie 表单）
+
     Impl(config::Settings& s, player::MusicPlayer& p, auth::LoginManager& lm, std::string cfg_path)
         : settings(s), player(p), login_manager(lm), config_path(std::move(cfg_path)) {
         // 初始化时扫描本地音乐库
@@ -154,22 +163,6 @@ struct AppUi::Impl {
         }
 
         local_scan_status = "共找到 " + std::to_string(local_tracks.size()) + " 首音乐";
-    }
-
-    // 播放选中的本地文件
-    void PlaySelectedTrack() {
-        if (local_tracks.empty()) {
-            return;
-        }
-        const auto idx = static_cast<size_t>(selected_local_track);
-        if (idx >= local_tracks.size()) {
-            return;
-        }
-        const auto& track = local_tracks[idx];
-        auto result = player.Play(track.file_path);
-        if (!result) {
-            local_scan_status = "播放失败: " + result.error().message;
-        }
     }
 
     // 在后台线程中拉取用户歌单列表
@@ -288,23 +281,28 @@ struct AppUi::Impl {
         }).detach();
     }
 
-    // 内部：跳转到队列指定索引，后台获取 URL、下载到本地缓存，再调用 player.Play()
-    // 流程：
-    //   1. 构造缓存文件路径 {cache_dir}/{song_id}.mp3
-    //   2. 若缓存文件已存在且非空，跳过 API 请求和下载，直接播放本地文件
-    //   3. 否则调用 FetchSongUrl 获取 CDN 地址，再调用 DownloadFile 下载到缓存
-    //   4. 最终调用 player.Play(cache_path)（本地路径，miniaudio 可正常加载）
+    // 内部：跳转到队列指定索引并播放
+    // 根据 QueueEntry::local_path 区分两种模式：
+    //   A. 本地文件（local_path 非空）：直接调用 player.Play(local_path)，无需网络请求
+    //   B. 在线歌曲（local_path 为空）：
+    //     1. 构造缓存文件路径 {cache_dir}/{song_id}.mp3
+    //     2. 若缓存文件已存在且非空，跳过 API 请求和下载，直接播放
+    //     3. 否则调用 FetchSongUrl 获取 CDN 地址，再调用 DownloadFile 下载到缓存
+    //     4. 最终调用 player.Play(cache_path)
     void PlayQueueAt(int idx, ScreenInteractive& screen_ref) {
         int64_t song_id = 0;
         std::string display_name;
+        std::string local_path;
         int queue_size = 0;
         {
             const std::lock_guard<std::mutex> lock(queue_mutex_);
             if (idx < 0 || static_cast<size_t>(idx) >= play_queue_.size())
                 return;
             current_queue_index_ = idx;
-            song_id = play_queue_[static_cast<size_t>(idx)].song_id;
-            display_name = play_queue_[static_cast<size_t>(idx)].display_name;
+            const auto& entry = play_queue_[static_cast<size_t>(idx)];
+            song_id = entry.song_id;
+            display_name = entry.display_name;
+            local_path = entry.local_path;
             queue_size = static_cast<int>(play_queue_.size());
         }
         // 立即更新状态栏，给用户即时反馈
@@ -312,7 +310,17 @@ struct AppUi::Impl {
                         std::to_string(queue_size) + ")";
         screen_ref.PostEvent(ftxui::Event::Custom);
 
-        // 后台线程：先检查缓存，再按需下载，最后播放
+        // 本地文件模式：直接播放，无需后台下载
+        if (!local_path.empty()) {
+            auto play_res = player.Play(local_path);
+            if (!play_res) {
+                queue_status_ = "播放失败: " + play_res.error().message;
+                screen_ref.PostEvent(ftxui::Event::Custom);
+            }
+            return;
+        }
+
+        // 在线歌曲模式：后台线程检查缓存、按需下载、最后播放
         std::thread([this, song_id, display_name, idx, queue_size, &screen_ref] {
             // 构造缓存文件路径
             const std::string cache_dir = config::ExpandHomePath(settings.cache_dir);
@@ -460,7 +468,7 @@ struct AppUi::Impl {
                 std::string name = tr.name;
                 if (!tr.artist.empty())
                     name += " - " + tr.artist;
-                play_queue_.push_back(QueueEntry{tr.id, std::move(name)});
+                play_queue_.push_back(QueueEntry{tr.id, std::move(name), ""});
             }
             current_queue_index_ = -1;
             // 将列表光标置于起始播放位置，方便用户在播放列表页面定位
@@ -543,7 +551,60 @@ struct AppUi::Impl {
         {
             const std::lock_guard<std::mutex> lock(queue_mutex_);
             was_empty = play_queue_.empty();
-            play_queue_.push_back(QueueEntry{tr.id, name});
+            play_queue_.push_back(QueueEntry{tr.id, name, ""});
+            new_idx = static_cast<int>(play_queue_.size()) - 1;
+            SyncQueueDisplayNames();
+        }
+        if (was_empty) {
+            PlayQueueAt(new_idx, screen_ref);
+        } else {
+            queue_status_ = "已加入队列: " + name;
+            screen_ref.PostEvent(ftxui::Event::Custom);
+        }
+    }
+
+    // 内部：用本地文件列表替换整个播放队列，并从 start_index 开始播放
+    // 与 ReplaceQueueWithTracks 对应，但为本地文件创建 QueueEntry（song_id=0, local_path 非空）
+    void ReplaceQueueWithLocalTracks(const std::vector<library::LocalTrack>& tracks,
+                                     int start_index, ScreenInteractive& screen_ref) {
+        {
+            const std::lock_guard<std::mutex> lock(queue_mutex_);
+            play_queue_.clear();
+            play_queue_.reserve(tracks.size());
+            for (const auto& tr : tracks) {
+                play_queue_.push_back(QueueEntry{0, tr.file_name, tr.file_path});
+            }
+            current_queue_index_ = -1;
+            selected_queue_track_ =
+                std::clamp(start_index, 0, std::max(0, static_cast<int>(play_queue_.size()) - 1));
+            SyncQueueDisplayNames();
+        }
+        PlayQueueAt(start_index, screen_ref);
+    }
+
+    // Enter 在本地文件页面：用全部本地文件替换队列，从选中文件开始播放
+    void PlayLocalTrackFromList(ScreenInteractive& screen_ref) {
+        if (local_tracks.empty())
+            return;
+        const int start = selected_local_track;
+        ReplaceQueueWithLocalTracks(local_tracks, start, screen_ref);
+    }
+
+    // Shift+Enter 在本地文件页面：将选中本地文件追加到队列末尾；若队列为空则立即播放
+    void AppendLocalTrackToQueue(ScreenInteractive& screen_ref) {
+        if (local_tracks.empty())
+            return;
+        const auto idx = static_cast<size_t>(selected_local_track);
+        if (idx >= local_tracks.size())
+            return;
+        const auto& track = local_tracks[idx];
+        const std::string name = track.file_name;
+        bool was_empty = false;
+        int new_idx = 0;
+        {
+            const std::lock_guard<std::mutex> lock(queue_mutex_);
+            was_empty = play_queue_.empty();
+            play_queue_.push_back(QueueEntry{0, name, track.file_path});
             new_idx = static_cast<int>(play_queue_.size()) - 1;
             SyncQueueDisplayNames();
         }
@@ -559,47 +620,89 @@ struct AppUi::Impl {
 
     // 歌单列表子视图（playlist_view_index_ == 0）
     // 调用方须已持有 playlists_mutex_
+    // 选中项附加 focus 装饰器，配合 yframe 实现自动滚动
     auto BuildPlaylistListContent() -> Element {
-        Elements items;
-        items.push_back(text("我的歌单") | bold | center);
-        items.push_back(separator());
-        items.push_back(text(playlist_status_.empty() ? "请先登录" : playlist_status_) | dim);
+        Elements header;
+        header.push_back(text("我的歌单") | bold | center);
+        header.push_back(separator());
+        header.push_back(text(playlist_status_.empty() ? "请先登录" : playlist_status_) | dim);
+
+        // 可滚动的歌单条目列表
+        Elements list_items;
         if (!user_playlists_.empty()) {
-            items.push_back(separator());
             for (size_t i = 0; i < user_playlists_.size(); ++i) {
                 auto row = text(playlist_display_names_[i]) | flex;
-                if (static_cast<int>(i) == selected_playlist_)
-                    row = row | inverted;
-                items.push_back(row);
+                if (static_cast<int>(i) == selected_playlist_) {
+                    row = row | inverted | focus;
+                }
+                list_items.push_back(row);
             }
         }
-        items.push_back(filler());
-        items.push_back(separator());
-        items.push_back(text("Enter: 打开  Shift+Enter: 替换队列播放  r: 刷新") | dim);
-        return vbox(std::move(items)) | flex;
+
+        Elements footer;
+        footer.push_back(separator());
+        footer.push_back(text("Enter: 打开  Shift+Enter: 替换队列播放  r: 刷新") | dim);
+
+        if (list_items.empty()) {
+            return vbox({
+                       vbox(std::move(header)),
+                       filler(),
+                       vbox(std::move(footer)),
+                   }) |
+                   flex;
+        }
+
+        return vbox({
+                   vbox(std::move(header)),
+                   separator(),
+                   vbox(std::move(list_items)) | yframe | vscroll_indicator | flex,
+                   vbox(std::move(footer)),
+               }) |
+               flex;
     }
 
     // 曲目列表子视图（playlist_view_index_ == 1）
     // 调用方须已持有 tracks_mutex_
+    // 选中项附加 focus 装饰器，配合 yframe 实现自动滚动
     auto BuildTrackListContent() -> Element {
-        Elements items;
-        items.push_back(text(open_playlist_name_) | bold | center);
-        items.push_back(separator());
-        items.push_back(text(track_list_status_.empty() ? "正在加载..." : track_list_status_) |
-                        dim);
+        Elements header;
+        header.push_back(text(open_playlist_name_) | bold | center);
+        header.push_back(separator());
+        header.push_back(text(track_list_status_.empty() ? "正在加载..." : track_list_status_) |
+                         dim);
+
+        // 可滚动的曲目条目列表
+        Elements list_items;
         if (!track_display_names_.empty()) {
-            items.push_back(separator());
             for (size_t i = 0; i < track_display_names_.size(); ++i) {
                 auto row = text(track_display_names_[i]) | flex;
-                if (static_cast<int>(i) == selected_track_)
-                    row = row | inverted;
-                items.push_back(row);
+                if (static_cast<int>(i) == selected_track_) {
+                    row = row | inverted | focus;
+                }
+                list_items.push_back(row);
             }
         }
-        items.push_back(filler());
-        items.push_back(separator());
-        items.push_back(text("Enter: 播放  Shift+Enter: 加入队列  Esc: 返回") | dim);
-        return vbox(std::move(items)) | flex;
+
+        Elements footer;
+        footer.push_back(separator());
+        footer.push_back(text("Enter: 播放  Shift+Enter: 加入队列  Esc: 返回") | dim);
+
+        if (list_items.empty()) {
+            return vbox({
+                       vbox(std::move(header)),
+                       filler(),
+                       vbox(std::move(footer)),
+                   }) |
+                   flex;
+        }
+
+        return vbox({
+                   vbox(std::move(header)),
+                   separator(),
+                   vbox(std::move(list_items)) | yframe | vscroll_indicator | flex,
+                   vbox(std::move(footer)),
+               }) |
+               flex;
     }
 
     // 我的歌单页面入口：根据 playlist_view_index_ 分发到对应子视图
@@ -614,50 +717,70 @@ struct AppUi::Impl {
 
     // 播放列表页面：展示当前播放队列
     // ♪ 标记正在播放的条目，高亮反显当前光标选中项（两者可不同）
+    // 选中项附加 focus 装饰器，配合 yframe 实现自动滚动
     auto BuildQueueContent() -> Element {
-        Elements items;
-        items.push_back(text("播放列表") | bold | center);
-        items.push_back(separator());
+        Elements header;
+        header.push_back(text("播放列表") | bold | center);
+        header.push_back(separator());
 
         const std::lock_guard<std::mutex> lock(queue_mutex_);
 
         if (play_queue_.empty()) {
             // 队列为空时给出引导提示
+            Elements items;
+            items.push_back(vbox(std::move(header)));
             items.push_back(filler());
             items.push_back(text("播放列表为空") | dim | center);
             items.push_back(text("在「我的歌单」曲目列表中按 Enter 加载歌单") | dim | center);
             items.push_back(filler());
-        } else {
-            items.push_back(text("共 " + std::to_string(play_queue_.size()) + " 首") | dim);
             items.push_back(separator());
-
-            for (size_t i = 0; i < play_queue_.size(); ++i) {
-                const bool is_now_playing = (static_cast<int>(i) == current_queue_index_);
-                const bool is_selected = (static_cast<int>(i) == selected_queue_track_);
-
-                // 左侧图标：♪ 表示正在播放，空格占位保持对齐
-                auto icon = text(is_now_playing ? "♪ " : "  ");
-                auto name = text(play_queue_[i].display_name) | flex;
-
-                auto row = hbox({std::move(icon), std::move(name)});
-
-                if (is_selected && is_now_playing) {
-                    // 光标与播放项重合：高亮 + 青色
-                    row = row | inverted | color(Color::Cyan);
-                } else if (is_selected) {
-                    row = row | inverted;
-                } else if (is_now_playing) {
-                    // 仅播放中：绿色标记
-                    row = row | color(Color::Green);
-                }
-                items.push_back(row);
-            }
+            items.push_back(text("Enter/Shift+Enter: 跳播  d: 删除  [/]: 上/下一首") | dim);
+            return vbox(std::move(items)) | flex;
         }
 
-        items.push_back(filler());
-        items.push_back(separator());
-        items.push_back(text("Enter/Shift+Enter: 跳播  d: 删除  [/]: 上/下一首") | dim);
-        return vbox(std::move(items)) | flex;
+        header.push_back(text("共 " + std::to_string(play_queue_.size()) + " 首") | dim);
+        header.push_back(separator());
+
+        // 可滚动的条目列表
+        Elements list_items;
+        for (size_t i = 0; i < play_queue_.size(); ++i) {
+            const bool is_now_playing = (static_cast<int>(i) == current_queue_index_);
+            const bool is_selected = (static_cast<int>(i) == selected_queue_track_);
+
+            // 左侧图标：♪ 表示正在播放，空格占位保持对齐
+            auto icon = text(is_now_playing ? "♪ " : "  ");
+            auto name = text(play_queue_[i].display_name) | flex;
+
+            auto row = hbox({std::move(icon), std::move(name)});
+
+            if (is_selected && is_now_playing) {
+                // 光标与播放项重合：高亮 + 青色
+                row = row | inverted | color(Color::Cyan);
+            } else if (is_selected) {
+                row = row | inverted;
+            } else if (is_now_playing) {
+                // 仅播放中：绿色标记
+                row = row | color(Color::Green);
+            }
+
+            // 选中项附加 focus，使 yframe 自动滚动到此处
+            if (is_selected) {
+                row = row | focus;
+            }
+            list_items.push_back(row);
+        }
+
+        // 底部固定提示栏
+        Elements footer;
+        footer.push_back(separator());
+        footer.push_back(text("Enter/Shift+Enter: 跳播  d: 删除  [/]: 上/下一首") | dim);
+
+        return vbox({
+                   vbox(std::move(header)),
+                   vbox(std::move(list_items)) | yframe | vscroll_indicator | flex,
+                   vbox(std::move(footer)),
+               }) |
+               flex;
     }
 
     // 使用系统默认编辑器打开配置文件    // 流程：
@@ -743,40 +866,53 @@ struct AppUi::Impl {
     }
 
     // 本地文件页面内容
+    // 选中项附加 focus 装饰器，配合 yframe 实现自动滚动
     auto BuildLocalFilesContent() -> Element {
-        Elements items;
-        items.push_back(text("本地音乐库: " + config::ExpandHomePath(settings.music_library_path)) |
-                        bold);
-        items.push_back(separator());
+        Elements header;
+        header.push_back(
+            text("本地音乐库: " + config::ExpandHomePath(settings.music_library_path)) | bold);
+        header.push_back(separator());
 
         if (local_tracks.empty()) {
+            Elements items;
+            items.push_back(vbox(std::move(header)));
             items.push_back(text(local_scan_status.empty() ? "暂无音乐文件" : local_scan_status) |
                             dim);
-        } else {
-            items.push_back(text(local_scan_status) | dim);
+            items.push_back(filler());
             items.push_back(separator());
+            items.push_back(text("Enter: 播放  Shift+Enter: 加入队列  r: 刷新") | dim);
+            return vbox(std::move(items)) | flex;
+        }
 
-            // 显示文件列表（带选中高亮）
-            for (size_t i = 0; i < local_tracks.size(); ++i) {
-                const auto& track = local_tracks[i];
-                auto line = hbox({
-                    text(std::to_string(i + 1) + ". "),
-                    text(track.file_name) | flex,
-                    text(" [" + track.extension + "]") | dim,
-                });
-                if (static_cast<int>(i) == selected_local_track) {
-                    line = line | inverted;
-                }
-                items.push_back(line);
+        header.push_back(text(local_scan_status) | dim);
+        header.push_back(separator());
+
+        // 可滚动的文件列表
+        Elements list_items;
+        for (size_t i = 0; i < local_tracks.size(); ++i) {
+            const auto& track = local_tracks[i];
+            auto line = hbox({
+                text(std::to_string(i + 1) + ". "),
+                text(track.file_name) | flex,
+                text(" [" + track.extension + "]") | dim,
+            });
+            if (static_cast<int>(i) == selected_local_track) {
+                line = line | inverted | focus;
             }
+            list_items.push_back(line);
         }
 
         // 底部操作提示
-        items.push_back(filler());
-        items.push_back(separator());
-        items.push_back(text("Enter: 播放 | r: 刷新 | Space: 暂停/恢复 | s: 停止") | dim);
+        Elements footer;
+        footer.push_back(separator());
+        footer.push_back(text("Enter: 播放  Shift+Enter: 加入队列  r: 刷新") | dim);
 
-        return vbox(std::move(items)) | flex;
+        return vbox({
+                   vbox(std::move(header)),
+                   vbox(std::move(list_items)) | yframe | vscroll_indicator | flex,
+                   vbox(std::move(footer)),
+               }) |
+               flex;
     }
 
     // 将二维码矩阵渲染为半块字符 Element，纵向合并两行为一行
@@ -872,6 +1008,27 @@ struct AppUi::Impl {
         return vbox(std::move(items)) | border;
     }
 
+    // 构建 Cookie 登录表单区域
+    // 包含单个 Cookie 输入框以及确认/取消按钮
+    // 仅在 password_form_tab_ == 2 时由 BuildLoginSection() 调用
+    auto BuildCookieForm() -> Element {
+        if (!static_cast<bool>(input_cookie)) {
+            return text("表单未初始化") | dim;
+        }
+        Elements items;
+        items.push_back(text("Cookie 登录") | bold | center);
+        items.push_back(separator());
+        items.push_back(text("请从浏览器中复制网易云音乐的 Cookie（须包含 MUSIC_U）") | dim);
+        items.push_back(hbox({text("Cookie: ") | bold, input_cookie->Render() | flex}));
+        items.push_back(hbox({
+            filler(),
+            btn_confirm_cookie_login->Render(),
+            text("  "),
+            btn_cancel_cookie_form->Render(),
+        }));
+        return vbox(std::move(items)) | border;
+    }
+
     // 构建设置页面顶部的登录区域
     // 根据 LoginManager 的当前状态显示不同内容，按钮以内联 "[label]" 形式嵌入文字行：
     //   - kLoggedIn         : ● 已登录：用户名 [刷新] [退出登录]
@@ -888,9 +1045,12 @@ struct AppUi::Impl {
         // 按钮未初始化时（Run() 调用前）退化为纯文本显示
         const bool btns_ready = static_cast<bool>(btn_scan_login);
 
-        // 优先显示账密登录表单（任何状态下均可切换）
+        // 优先显示登录表单（任何状态下均可切换）
         if (password_form_tab_ == 1 && btns_ready) {
             return BuildPasswordForm();
+        }
+        if (password_form_tab_ == 2 && btns_ready) {
+            return BuildCookieForm();
         }
 
         Elements items;
@@ -922,7 +1082,8 @@ struct AppUi::Impl {
                                 color(Color::Yellow) | center);
                 if (btns_ready) {
                     items.push_back(hbox({text("  "), btn_scan_login->Render(), text("  "),
-                                          btn_password_login->Render()}) |
+                                          btn_password_login->Render(), text("  "),
+                                          btn_cookie_login->Render()}) |
                                     center);
                 }
                 break;
@@ -939,6 +1100,8 @@ struct AppUi::Impl {
                     row.push_back(btn_scan_login->Render());
                     row.push_back(text("  "));
                     row.push_back(btn_password_login->Render());
+                    row.push_back(text("  "));
+                    row.push_back(btn_cookie_login->Render());
                 }
                 items.push_back(hbox(std::move(row)) | center);
                 break;
@@ -959,6 +1122,8 @@ struct AppUi::Impl {
                     row.push_back(text("  "));
                     row.push_back(btn_password_login->Render());
                     row.push_back(text("  "));
+                    row.push_back(btn_cookie_login->Render());
+                    row.push_back(text("  "));
                     row.push_back(btn_refresh->Render());
                 }
                 items.push_back(hbox(std::move(row)) | center);
@@ -975,6 +1140,8 @@ struct AppUi::Impl {
                     row.push_back(text("  "));
                     row.push_back(btn_password_login->Render());
                     row.push_back(text("  "));
+                    row.push_back(btn_cookie_login->Render());
+                    row.push_back(text("  "));
                     row.push_back(btn_refresh->Render());
                 }
                 items.push_back(hbox(std::move(row)) | center);
@@ -990,6 +1157,8 @@ struct AppUi::Impl {
                     row.push_back(btn_scan_login->Render());
                     row.push_back(text("  "));
                     row.push_back(btn_password_login->Render());
+                    row.push_back(text("  "));
+                    row.push_back(btn_cookie_login->Render());
                 }
                 items.push_back(hbox(std::move(row)) | center);
                 break;
@@ -1173,10 +1342,42 @@ void AppUi::Run() {
         impl_->screen.PostEvent(ftxui::Event::Custom);
     });
 
-    // Tab=0：正常按钮行（扫码登录、账密登录、刷新、退出登录）
+    // Cookie 登录按钮：点击后切换至 Cookie 输入表单
+    impl_->btn_cookie_login = Impl::MakeInlineButton("Cookie登录", [this] {
+        impl_->password_form_tab_ = 2;
+        impl_->cookie_input_value_.clear();
+        impl_->screen.PostEvent(ftxui::Event::Custom);
+    });
+
+    // Cookie 输入框（Enter 键直接提交）
+    {
+        InputOption opt;
+        opt.placeholder = "请粘贴包含 MUSIC_U 的 Cookie 字符串";
+        opt.on_enter = [this] {
+            impl_->login_manager.StartCookieLogin(impl_->cookie_input_value_);
+            impl_->password_form_tab_ = 0;
+        };
+        impl_->input_cookie = Input(&impl_->cookie_input_value_, opt);
+    }
+
+    // Cookie 表单确认登录按钮
+    impl_->btn_confirm_cookie_login = Impl::MakeInlineButton("确认登录", [this] {
+        impl_->login_manager.StartCookieLogin(impl_->cookie_input_value_);
+        impl_->password_form_tab_ = 0;
+    });
+
+    // Cookie 表单取消按钮
+    impl_->btn_cancel_cookie_form = Impl::MakeInlineButton("取消", [this] {
+        impl_->password_form_tab_ = 0;
+        impl_->cookie_input_value_.clear();
+        impl_->screen.PostEvent(ftxui::Event::Custom);
+    });
+
+    // Tab=0：正常按钮行（扫码登录、账密登录、Cookie登录、刷新、退出登录）
     auto normal_buttons = Container::Horizontal({
         impl_->btn_scan_login,
         impl_->btn_password_login,
+        impl_->btn_cookie_login,
         impl_->btn_refresh,
         impl_->btn_logout,
     });
@@ -1186,9 +1387,14 @@ void AppUi::Run() {
         impl_->input_password,
         Container::Horizontal({impl_->btn_confirm_login, impl_->btn_cancel_form}),
     });
+    // Tab=2：Cookie 登录表单（Cookie 输入框、确认/取消按钮）
+    auto cookie_form_container = Container::Vertical({
+        impl_->input_cookie,
+        Container::Horizontal({impl_->btn_confirm_cookie_login, impl_->btn_cancel_cookie_form}),
+    });
     // Container::Tab 确保只有激活标签的子组件接收焦点与事件
-    auto settings_buttons =
-        Container::Tab({normal_buttons, form_container}, &impl_->password_form_tab_);
+    auto settings_buttons = Container::Tab({normal_buttons, form_container, cookie_form_container},
+                                           &impl_->password_form_tab_);
     // 构建左侧菜单组件
     auto menu = impl_->BuildMenu();
 
@@ -1271,9 +1477,10 @@ void AppUi::Run() {
     // Shift+Enter 在 Kitty 协议终端下产生 \x1b[13;2u
     const Event kShiftEnter = Event::Special("\x1b[13;2u");
     auto main_component = CatchEvent(renderer, [this, kShiftEnter](Event event) {
-        // 当账密登录表单处于激活状态时，所有字符键事件直接传递给输入框处理，
-        // 避免 q/e/[/] 等全局快捷键在用户输入手机号或密码时意外触发
-        if (impl_->password_form_tab_ == 1 && event.is_character()) {
+        // 当登录表单处于激活状态时（账密表单或 Cookie 表单），
+        // 所有字符键事件直接传递给输入框处理，
+        // 避免 q/e/[/] 等全局快捷键在用户输入时意外触发
+        if (impl_->password_form_tab_ != 0 && event.is_character()) {
             return false;
         }
 
@@ -1352,25 +1559,18 @@ void AppUi::Run() {
 
         // ── 本地文件页面 ──
         if (impl_->selected_menu == 3) {
+            // Enter：用全部本地文件替换队列，从选中文件开始播放
             if (event == Event::Return) {
-                impl_->PlaySelectedTrack();
+                impl_->PlayLocalTrackFromList(impl_->screen);
+                return true;
+            }
+            // Shift+Enter：将选中本地文件追加到队列末尾
+            if (event == kShiftEnter) {
+                impl_->AppendLocalTrackToQueue(impl_->screen);
                 return true;
             }
             if (event == Event::Character('r')) {
                 impl_->RefreshLocalLibrary();
-                return true;
-            }
-            if (event == Event::Character(' ')) {
-                const auto state = impl_->player.GetState();
-                if (state == player::PlayerState::kPlaying) {
-                    impl_->player.Pause();
-                } else if (state == player::PlayerState::kPaused) {
-                    impl_->player.Resume();
-                }
-                return true;
-            }
-            if (event == Event::Character('s')) {
-                impl_->player.Stop();
                 return true;
             }
         }

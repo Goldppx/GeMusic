@@ -10,57 +10,126 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # ============================================================
-# 第三方依赖（FetchContent 在线下载）
+# 构建模式选项
 # ============================================================
+# USE_SYSTEM_LIBS=ON  → 优先使用系统已安装的包（本地构建，速度快）
+# USE_SYSTEM_LIBS=OFF → 全部通过 FetchContent 在线下载（默认行为，兼容性好）
+#
+# 用法示例：
+#   cmake -B build -DUSE_SYSTEM_LIBS=ON       # 本地模式
+#   cmake -B build                              # 在线模式（默认）
+option(USE_SYSTEM_LIBS "优先使用系统已安装的库，而非 FetchContent 在线下载" ON)
+
 include(FetchContent)
 
-# FTXUI 6.1.9 - 终端 UI 框架
-FetchContent_Declare(
+# ============================================================
+# 辅助宏：尝试 find_package，失败时回退到 FetchContent
+# ============================================================
+# 当 USE_SYSTEM_LIBS=ON 时先尝试 find_package，找不到则自动回退 FetchContent。
+# 当 USE_SYSTEM_LIBS=OFF 时直接走 FetchContent。
+macro(try_system_or_fetch _name)
+    # 解析 FETCH 关键字，将其前后参数分别作为 find_package / FetchContent_Declare 参数
+    set(_fetch_args)
+    set(_find_args)
+    set(_in_fetch FALSE)
+    foreach(_arg ${ARGN})
+        if("${_arg}" STREQUAL "FETCH")
+            set(_in_fetch TRUE)
+        elseif(_in_fetch)
+            list(APPEND _fetch_args "${_arg}")
+        else()
+            list(APPEND _find_args "${_arg}")
+        endif()
+    endforeach()
+
+    set(_found_system_${_name} FALSE)
+    if(USE_SYSTEM_LIBS)
+        find_package(${_find_args} QUIET)
+        # find_package 设置 <PackageName>_FOUND，包名大小写可能不同
+        string(TOUPPER "${_name}" _NAME_UPPER)
+        if(${_name}_FOUND OR ${_NAME_UPPER}_FOUND)
+            set(_found_system_${_name} TRUE)
+            message(STATUS "[GeMusic] 使用系统包: ${_name}")
+        endif()
+    endif()
+
+    if(NOT _found_system_${_name})
+        if(USE_SYSTEM_LIBS)
+            message(STATUS "[GeMusic] 系统未找到 ${_name}，回退到 FetchContent")
+        else()
+            message(STATUS "[GeMusic] FetchContent 在线下载: ${_name}")
+        endif()
+        FetchContent_Declare(${_name} ${_fetch_args})
+        # 记录需要 MakeAvailable 的目标
+        list(APPEND _GEMUSIC_FETCH_TARGETS ${_name})
+    endif()
+endmacro()
+
+# ============================================================
+# 第三方依赖声明
+# ============================================================
+set(_GEMUSIC_FETCH_TARGETS "")
+
+# --- FTXUI 6.1.9 - 终端 UI 框架 ---
+# 注意：FTXUI 没有主流发行版的系统包，始终通过 FetchContent 获取
+try_system_or_fetch(ftxui
     ftxui
-    GIT_REPOSITORY https://github.com/ArthurSonzogni/FTXUI.git
-    GIT_TAG        v6.1.9
-    GIT_SHALLOW    TRUE
+    FETCH
+        GIT_REPOSITORY https://github.com/ArthurSonzogni/FTXUI.git
+        GIT_TAG        v6.1.9
+        GIT_SHALLOW    TRUE
 )
 
-# nlohmann/json 3.12.0 - JSON 解析
-FetchContent_Declare(
-    json
-    GIT_REPOSITORY https://github.com/nlohmann/json.git
-    GIT_TAG        v3.12.0
-    GIT_SHALLOW    TRUE
+# --- nlohmann/json 3.12.0 - JSON 解析 ---
+# Arch: pacman -S nlohmann-json
+try_system_or_fetch(nlohmann_json
+    nlohmann_json
+    FETCH
+        GIT_REPOSITORY https://github.com/nlohmann/json.git
+        GIT_TAG        v3.12.0
+        GIT_SHALLOW    TRUE
 )
 
-# yaml-cpp 0.9.0 - YAML 配置文件解析
-FetchContent_Declare(
+# --- yaml-cpp - YAML 配置文件解析 ---
+# Arch: pacman -S yaml-cpp
+try_system_or_fetch(yaml-cpp
     yaml-cpp
-    GIT_REPOSITORY https://github.com/jbeder/yaml-cpp.git
-    GIT_TAG        yaml-cpp-0.9.0
-    GIT_SHALLOW    TRUE
+    FETCH
+        GIT_REPOSITORY https://github.com/jbeder/yaml-cpp.git
+        GIT_TAG        yaml-cpp-0.9.0
+        GIT_SHALLOW    TRUE
 )
 
-# GoogleTest 1.16.0 - 单元测试
-FetchContent_Declare(
-    googletest
-    GIT_REPOSITORY https://github.com/google/googletest.git
-    GIT_TAG        v1.16.0
-    GIT_SHALLOW    TRUE
+# --- GoogleTest - 单元测试 ---
+# Arch: pacman -S gtest
+try_system_or_fetch(GTest
+    GTest
+    FETCH
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG        v1.16.0
+        GIT_SHALLOW    TRUE
 )
 
-# spdlog 1.15.3 - 日志库
-FetchContent_Declare(
+# --- spdlog - 日志库 ---
+# Arch: pacman -S spdlog
+try_system_or_fetch(spdlog
     spdlog
-    GIT_REPOSITORY https://github.com/gabime/spdlog.git
-    GIT_TAG        v1.15.3
-    GIT_SHALLOW    TRUE
+    FETCH
+        GIT_REPOSITORY https://github.com/gabime/spdlog.git
+        GIT_TAG        v1.15.3
+        GIT_SHALLOW    TRUE
 )
 
-# 统一拉取所有基于 CMake 的依赖
-FetchContent_MakeAvailable(ftxui json yaml-cpp googletest spdlog)
+# 统一拉取所有需要 FetchContent 的依赖
+if(_GEMUSIC_FETCH_TARGETS)
+    message(STATUS "[GeMusic] FetchContent_MakeAvailable: ${_GEMUSIC_FETCH_TARGETS}")
+    FetchContent_MakeAvailable(${_GEMUSIC_FETCH_TARGETS})
+endif()
 
-# OpenSSL - AES-CBC + RSA 加密（网易云接口加密必须）
+# --- OpenSSL - AES-CBC + RSA 加密（网易云接口加密必须）---
 find_package(OpenSSL REQUIRED)
 
-# qrcodegen - 二维码生成（nayuki/QR-Code-generator v1.8.0）
+# --- qrcodegen - 二维码生成（nayuki/QR-Code-generator v1.8.0）---
 # 该库只有两个文件，直接用 file(DOWNLOAD) 下载到 build 目录，避免触碰已弃用的
 # FetchContent_Populate。文件已存在时跳过下载，不产生重复网络请求。
 set(QRCODEGEN_VERSION "v1.8.0")
