@@ -171,10 +171,11 @@ struct AppUi::Impl {
     Component btn_cancel_cookie_form;    // [取消]（Cookie 表单）
 
     // ── 歌词相关状态 ──
-    // 是否显示右侧歌词面板（按 l 键切换）
-    bool show_lyrics_ = false;
-    // 歌词面板宽度（字符列数）
-    int lyrics_panel_width_ = 35;
+    // 歌词面板宽度（字符列数）；0 表示隐藏，> 0 表示显示
+    // 由 outer_split 的 main_size 直接控制，可拖拽调整
+    int lyrics_panel_width_ = 0;
+    // 隐藏前保存的宽度，按 l 键恢复时使用
+    int saved_lyrics_width_ = 35;
     // 歌词面板可见区域的屏幕包围盒（reflect 写入，用于计算可见行数）
     Box lyrics_area_box_;
     // 歌词管理器：负责异步加载与查询
@@ -1165,12 +1166,14 @@ struct AppUi::Impl {
 
         // 计算可见区域行数（由 reflect(lyrics_area_box_) 写入）
         const int visible_rows = std::max(1, lyrics_area_box_.y_max - lyrics_area_box_.y_min + 1);
+        // 减去标题行和分隔线各 1 行，得到实际可显示的歌词行数
+        const int lyric_rows = std::max(1, visible_rows - 2);
 
         // 自动滚动：将当前行保持在可见区域中央
+        // 只 clamp 下界为 0；不 clamp 上界，末尾空白由 filler() 补齐
         int scroll_top = 0;
         if (cur_line >= 0 && total_lines > 0) {
-            scroll_top = cur_line - visible_rows / 2;
-            scroll_top = std::max(0, std::min(scroll_top, std::max(0, total_lines - visible_rows)));
+            scroll_top = std::max(0, cur_line - lyric_rows / 2);
         }
 
         // 状态未加载时显示占位文字
@@ -1208,7 +1211,7 @@ struct AppUi::Impl {
         rows.push_back(text("歌词") | bold | center);
         rows.push_back(separator());
 
-        const int end = std::min(scroll_top + visible_rows, total_lines);
+        const int end = std::min(scroll_top + lyric_rows, total_lines);
         for (int i = scroll_top; i < end; ++i) {
             const auto& line = lines[static_cast<size_t>(i)];
             const int dist = std::abs(i - cur_line);
@@ -1236,8 +1239,8 @@ struct AppUi::Impl {
             rows.push_back(std::move(row));
         }
 
-        // 若可见行少于可见区域高度，补充 filler
-        if (end - scroll_top < visible_rows) {
+        // 若渲染行少于可用歌词行数，补充 filler 撑满剩余空间
+        if (end - scroll_top < lyric_rows) {
             rows.push_back(filler());
         }
 
@@ -1780,6 +1783,24 @@ void AppUi::Run() {
     split_options.separator_func = [] { return separatorEmpty(); };
     auto split = ResizableSplit(split_options);
 
+    // 歌词面板组件：纯 Renderer，将 BuildLyricsContent() 输出通过 reflect 记录包围盒
+    // 不需要聚焦/事件处理，故使用无状态 Renderer
+    auto lyrics_component =
+        Renderer([this] { return impl_->BuildLyricsContent() | reflect(impl_->lyrics_area_box_); });
+
+    // 外层可拖拽分割：左侧为 split（菜单+内容区），右侧为歌词面板
+    // main_size = &lyrics_panel_width_，值为 0 时歌词面板零宽（等效隐藏）
+    // separator_func：宽度 > 0 时渲染实线分隔符，否则渲染空文本（不占宽度）
+    ResizableSplitOption outer_opts;
+    outer_opts.main = lyrics_component;
+    outer_opts.back = split;
+    outer_opts.direction = Direction::Right;
+    outer_opts.main_size = &impl_->lyrics_panel_width_;
+    outer_opts.separator_func = [this] {
+        return impl_->lyrics_panel_width_ > 0 ? separator() : text("");
+    };
+    auto outer_split = ResizableSplit(outer_opts);
+
     // 创建可拖拽进度条组件
     // 使用 0-1000 归一化范围（避免 duration_ms 变化导致 max 动态改变的问题）
     // color_inactive = Cyan：未聚焦时与原 gauge 颜色保持一致
@@ -1815,13 +1836,13 @@ void AppUi::Run() {
     };
     auto seek_slider_maybe = Maybe(seek_slider, show_seek);
 
-    // 将 split 与 seek_slider_maybe 放入同一 Container，确保两者都能接收到鼠标事件
+    // 将 outer_split 与 seek_slider_maybe 放入同一 Container，确保两者都能接收到鼠标事件
     // ComponentBase::OnEvent 对鼠标事件广播给所有子组件，seek_slider 通过
     // reflect(gauge_box_) 追踪自身屏幕位置，只响应落在进度条区域内的点击/拖拽
-    auto main_layout = Container::Vertical({split, seek_slider_maybe});
+    auto main_layout = Container::Vertical({outer_split, seek_slider_maybe});
 
     // 通过 main_layout 确保渲染链从根组件发起，焦点状态能正确传递至各子组件
-    auto renderer = Renderer(main_layout, [this, &split, seek_slider] {
+    auto renderer = Renderer(main_layout, [this, &outer_split, seek_slider] {
         // 同步播放进度到 seek_pos_（0-1000）
         // seek 后 500ms 内不覆盖，避免拖拽时进度条被渲染线程跳回
         const auto state = impl_->player.GetState();
@@ -1838,19 +1859,9 @@ void AppUi::Run() {
         }
         return vbox({
             impl_->BuildTitleBar(),
-            // 根据 show_lyrics_ 决定是否在右侧追加歌词面板
-            // 歌词面板通过 reflect(lyrics_area_box_) 记录可见区域，供 BuildLyricsContent 计算滚动
-            [&]() -> Element {
-                if (impl_->show_lyrics_) {
-                    return hbox({
-                        split->Render() | flex,
-                        separator(),
-                        impl_->BuildLyricsContent() | reflect(impl_->lyrics_area_box_) |
-                            size(WIDTH, EQUAL, impl_->lyrics_panel_width_),
-                    });
-                }
-                return split->Render() | flex;
-            }(),
+            // outer_split 包含左侧主内容区（菜单+内容）和右侧可选歌词面板
+            // lyrics_panel_width_ == 0 时歌词面板零宽，等效隐藏；> 0 时可拖拽分界线
+            outer_split->Render() | flex,
             impl_->BuildPlayerBar(seek_slider->Render() | flex | color(Color::Cyan)),
         });
     });
@@ -1871,8 +1882,16 @@ void AppUi::Run() {
         }
 
         // ── 全局：切换歌词面板显示/隐藏（l 键）──
+        // lyrics_panel_width_ == 0 表示隐藏；切换时保存/恢复上次宽度，不重置拖拽位置
         if (event == Event::Character('l')) {
-            impl_->show_lyrics_ = !impl_->show_lyrics_;
+            if (impl_->lyrics_panel_width_ > 0) {
+                // 当前显示 → 保存宽度后隐藏
+                impl_->saved_lyrics_width_ = impl_->lyrics_panel_width_;
+                impl_->lyrics_panel_width_ = 0;
+            } else {
+                // 当前隐藏 → 恢复上次保存的宽度
+                impl_->lyrics_panel_width_ = impl_->saved_lyrics_width_;
+            }
             impl_->screen.PostEvent(ftxui::Event::Custom);
             return true;
         }
