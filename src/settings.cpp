@@ -22,7 +22,7 @@ auto ExpandHomePath(std::string_view path) -> std::string {
 }
 
 auto GetDefaultConfigPath() -> std::string {
-    return "config/gemusic.yaml";
+    return ExpandHomePath("~/.config/GeMusic/config.yaml");
 }
 
 auto LoadSettings(std::string_view path) -> std::expected<Settings, AppError> {
@@ -89,6 +89,9 @@ auto SaveSettings(const Settings& settings, std::string_view path)
         out << YAML::Key << "music_library_path" << YAML::Value << settings.music_library_path;
         out << YAML::Key << "s_device_id" << YAML::Value << settings.s_device_id;
         out << YAML::EndMap;
+
+        // 确保父目录存在（首次运行时 ~/.config/GeMusic/ 可能尚未创建）
+        std::filesystem::create_directories(std::filesystem::path(std::string(path)).parent_path());
 
         // 写入文件
         std::ofstream fout{std::string(path)};
