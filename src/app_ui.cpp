@@ -113,6 +113,20 @@ struct AppUi::Impl {
     Component btn_refresh;     // [刷新]     — 触发 TryAutoLogin()
     Component btn_logout;      // [退出登录] — 触发 Logout()
 
+    // ── 账密登录表单状态 ──
+    // 0 = 正常按钮行，1 = 账密登录表单（Container::Tab 切换索引）
+    int password_form_tab_ = 0;
+    // 手机号输入框绑定值
+    std::string phone_input_value_;
+    // 密码输入框绑定值（掩码显示）
+    std::string password_input_value_;
+
+    Component btn_password_login;  // [账密登录] — 切换至账密登录表单
+    Component input_phone;         // 手机号输入框
+    Component input_password;      // 密码输入框（掩码）
+    Component btn_confirm_login;   // [确认登录]
+    Component btn_cancel_form;     // [取消]
+
     Impl(config::Settings& s, player::MusicPlayer& p, auth::LoginManager& lm, std::string cfg_path)
         : settings(s), player(p), login_manager(lm), config_path(std::move(cfg_path)) {
         // 初始化时扫描本地音乐库
@@ -837,6 +851,27 @@ struct AppUi::Impl {
         return Button(std::move(label), std::move(on_click), std::move(opt));
     }
 
+    // 构建账密登录表单区域
+    // 包含手机号输入框、密码输入框（掩码）以及确认/取消按钮
+    // 仅在 password_form_tab_ == 1 时由 BuildLoginSection() 调用
+    auto BuildPasswordForm() -> Element {
+        if (!static_cast<bool>(input_phone)) {
+            return text("表单未初始化") | dim;
+        }
+        Elements items;
+        items.push_back(text("账密登录") | bold | center);
+        items.push_back(separator());
+        items.push_back(hbox({text("手机号: ") | bold, input_phone->Render() | flex}));
+        items.push_back(hbox({text("密  码: ") | bold, input_password->Render() | flex}));
+        items.push_back(hbox({
+            filler(),
+            btn_confirm_login->Render(),
+            text("  "),
+            btn_cancel_form->Render(),
+        }));
+        return vbox(std::move(items)) | border;
+    }
+
     // 构建设置页面顶部的登录区域
     // 根据 LoginManager 的当前状态显示不同内容，按钮以内联 "[label]" 形式嵌入文字行：
     //   - kLoggedIn         : ● 已登录：用户名 [刷新] [退出登录]
@@ -852,6 +887,11 @@ struct AppUi::Impl {
 
         // 按钮未初始化时（Run() 调用前）退化为纯文本显示
         const bool btns_ready = static_cast<bool>(btn_scan_login);
+
+        // 优先显示账密登录表单（任何状态下均可切换）
+        if (password_form_tab_ == 1 && btns_ready) {
+            return BuildPasswordForm();
+        }
 
         Elements items;
 
@@ -881,13 +921,15 @@ struct AppUi::Impl {
                 items.push_back(text(status_text.empty() ? "请使用网易云 App 扫描" : status_text) |
                                 color(Color::Yellow) | center);
                 if (btns_ready) {
-                    items.push_back(hbox({text("  "), btn_scan_login->Render()}) | center);
+                    items.push_back(hbox({text("  "), btn_scan_login->Render(), text("  "),
+                                          btn_password_login->Render()}) |
+                                    center);
                 }
                 break;
             }
 
             case auth::LoginState::kVerifying: {
-                // 校验已保存的 cookies，允许跳过直接扫码
+                // 校验已保存的 cookies，允许跳过直接扫码或账密登录
                 Elements row;
                 row.push_back(text("正在验证登录状态...") | dim);
                 if (btns_ready) {
@@ -895,6 +937,8 @@ struct AppUi::Impl {
                     row.push_back(btn_refresh->Render());
                     row.push_back(text("  "));
                     row.push_back(btn_scan_login->Render());
+                    row.push_back(text("  "));
+                    row.push_back(btn_password_login->Render());
                 }
                 items.push_back(hbox(std::move(row)) | center);
                 break;
@@ -913,6 +957,8 @@ struct AppUi::Impl {
                     row.push_back(text("  "));
                     row.push_back(btn_scan_login->Render());
                     row.push_back(text("  "));
+                    row.push_back(btn_password_login->Render());
+                    row.push_back(text("  "));
                     row.push_back(btn_refresh->Render());
                 }
                 items.push_back(hbox(std::move(row)) | center);
@@ -927,6 +973,8 @@ struct AppUi::Impl {
                     row.push_back(text("  "));
                     row.push_back(btn_scan_login->Render());
                     row.push_back(text("  "));
+                    row.push_back(btn_password_login->Render());
+                    row.push_back(text("  "));
                     row.push_back(btn_refresh->Render());
                 }
                 items.push_back(hbox(std::move(row)) | center);
@@ -940,6 +988,8 @@ struct AppUi::Impl {
                 if (btns_ready) {
                     row.push_back(text("  "));
                     row.push_back(btn_scan_login->Render());
+                    row.push_back(text("  "));
+                    row.push_back(btn_password_login->Render());
                 }
                 items.push_back(hbox(std::move(row)) | center);
                 break;
@@ -1080,9 +1130,65 @@ void AppUi::Run() {
     impl_->btn_logout =
         Impl::MakeInlineButton("退出登录", [this] { impl_->login_manager.Logout(); });
 
-    // 三个按钮放入 Horizontal 容器，Tab 键可依次聚焦
+    // 账密登录按钮：点击后切换至账密输入表单
+    impl_->btn_password_login = Impl::MakeInlineButton("账密登录", [this] {
+        impl_->password_form_tab_ = 1;
+        impl_->phone_input_value_.clear();
+        impl_->password_input_value_.clear();
+        impl_->screen.PostEvent(ftxui::Event::Custom);
+    });
+
+    // 手机号输入框
+    {
+        InputOption opt;
+        opt.placeholder = "请输入手机号";
+        impl_->input_phone = Input(&impl_->phone_input_value_, opt);
+    }
+
+    // 密码输入框（掩码显示，Enter 键直接提交登录）
+    {
+        InputOption opt;
+        opt.placeholder = "请输入密码";
+        opt.password = true;
+        opt.on_enter = [this] {
+            impl_->login_manager.StartPasswordLogin(impl_->phone_input_value_,
+                                                    impl_->password_input_value_);
+            impl_->password_form_tab_ = 0;
+        };
+        impl_->input_password = Input(&impl_->password_input_value_, opt);
+    }
+
+    // 确认登录按钮
+    impl_->btn_confirm_login = Impl::MakeInlineButton("确认登录", [this] {
+        impl_->login_manager.StartPasswordLogin(impl_->phone_input_value_,
+                                                impl_->password_input_value_);
+        impl_->password_form_tab_ = 0;
+    });
+
+    // 取消按钮：清空输入并返回正常按钮行
+    impl_->btn_cancel_form = Impl::MakeInlineButton("取消", [this] {
+        impl_->password_form_tab_ = 0;
+        impl_->phone_input_value_.clear();
+        impl_->password_input_value_.clear();
+        impl_->screen.PostEvent(ftxui::Event::Custom);
+    });
+
+    // Tab=0：正常按钮行（扫码登录、账密登录、刷新、退出登录）
+    auto normal_buttons = Container::Horizontal({
+        impl_->btn_scan_login,
+        impl_->btn_password_login,
+        impl_->btn_refresh,
+        impl_->btn_logout,
+    });
+    // Tab=1：账密登录表单（手机号输入框、密码输入框、确认/取消按钮）
+    auto form_container = Container::Vertical({
+        impl_->input_phone,
+        impl_->input_password,
+        Container::Horizontal({impl_->btn_confirm_login, impl_->btn_cancel_form}),
+    });
+    // Container::Tab 确保只有激活标签的子组件接收焦点与事件
     auto settings_buttons =
-        Container::Horizontal({impl_->btn_scan_login, impl_->btn_refresh, impl_->btn_logout});
+        Container::Tab({normal_buttons, form_container}, &impl_->password_form_tab_);
     // 构建左侧菜单组件
     auto menu = impl_->BuildMenu();
 
@@ -1165,6 +1271,12 @@ void AppUi::Run() {
     // Shift+Enter 在 Kitty 协议终端下产生 \x1b[13;2u
     const Event kShiftEnter = Event::Special("\x1b[13;2u");
     auto main_component = CatchEvent(renderer, [this, kShiftEnter](Event event) {
+        // 当账密登录表单处于激活状态时，所有字符键事件直接传递给输入框处理，
+        // 避免 q/e/[/] 等全局快捷键在用户输入手机号或密码时意外触发
+        if (impl_->password_form_tab_ == 1 && event.is_character()) {
+            return false;
+        }
+
         // q 键退出程序
         if (event == Event::Character('q')) {
             impl_->screen.Exit();

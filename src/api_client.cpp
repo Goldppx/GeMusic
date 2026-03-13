@@ -161,13 +161,21 @@ struct ApiClient::Impl {
 
         // 构建 cookies 字符串（包含设备信息和已有的认证 cookie）
         std::string cookie_str = cookies;
-        // 确保基本设备 cookie 存在（若未在 cookies 中设置则追加默认值）
-        if (cookie_str.find("os=") == std::string::npos) {
-            if (!cookie_str.empty()) {
-                cookie_str += "; ";
+        // 若 cookies 中缺少必要的 iOS 设备字段，逐一补充默认值
+        // 完整设备信息由 LoginManager::InjectDeviceCookies() 注入；
+        // 此处仅作兜底，确保非登录路径的 API 调用也能携带基本设备标识
+        const auto append_if_missing = [&](const std::string& key, const std::string& value) {
+            if (cookie_str.find(key + "=") == std::string::npos) {
+                if (!cookie_str.empty()) {
+                    cookie_str += "; ";
+                }
+                cookie_str += key + "=" + value;
             }
-            cookie_str += "os=ios; appver=9.0.65; __remember_me=true";
-        }
+        };
+        append_if_missing("os", "ios");
+        append_if_missing("appver", "9.0.65");
+        append_if_missing("osver", "17.4.1");
+        append_if_missing("__remember_me", "true");
 
         if (!cookie_str.empty()) {
             curl_easy_setopt(curl, CURLOPT_COOKIE, cookie_str.c_str());

@@ -32,6 +32,10 @@ struct Settings {
 
     // 本地音乐库路径，默认为用户主目录下的 Music 目录
     std::string music_library_path = "~/Music";
+
+    // 设备唯一标识符（52 位大写十六进制，首次启动时随机生成并持久化）
+    // 用于构造二维码 URL 中的 chainId 参数，绕过网易云 8821 风控
+    std::string s_device_id;
 };
 
 // 从 YAML 文件加载配置

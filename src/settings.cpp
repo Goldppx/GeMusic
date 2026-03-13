@@ -60,6 +60,9 @@ auto LoadSettings(std::string_view path) -> std::expected<Settings, AppError> {
         if (config["music_library_path"]) {
             settings.music_library_path = config["music_library_path"].as<std::string>();
         }
+        if (config["s_device_id"]) {
+            settings.s_device_id = config["s_device_id"].as<std::string>();
+        }
 
         return settings;
     } catch (const YAML::Exception& e) {
@@ -84,6 +87,7 @@ auto SaveSettings(const Settings& settings, std::string_view path)
         out << YAML::Key << "volume" << YAML::Value << settings.volume;
         out << YAML::Key << "cache_dir" << YAML::Value << settings.cache_dir;
         out << YAML::Key << "music_library_path" << YAML::Value << settings.music_library_path;
+        out << YAML::Key << "s_device_id" << YAML::Value << settings.s_device_id;
         out << YAML::EndMap;
 
         // 写入文件

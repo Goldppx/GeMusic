@@ -65,6 +65,11 @@ class LoginManager {
     // 退出登录：清除 cookies、user_name，保存配置，重置状态为 kIdle
     void Logout();
 
+    // 手机号+密码登录（异步，立即返回）
+    // phone    - 手机号（纯数字字符串）
+    // password - 明文密码（内部 MD5 后发送）
+    void StartPasswordLogin(std::string phone, std::string password);
+
     // 替换状态变化回调（在 AppUi::Run() 启动后调用，注册屏幕刷新函数）
     void SetOnStateChange(std::function<void()> callback);
 

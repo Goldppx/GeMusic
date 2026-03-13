@@ -10,54 +10,82 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # ============================================================
-# 第三方依赖（FetchContent）
+# 第三方依赖（FetchContent 在线下载）
 # ============================================================
 include(FetchContent)
 
-# FTXUI - 终端 UI 框架（使用本地已下载的源码）
+# FTXUI 6.1.9 - 终端 UI 框架
 FetchContent_Declare(
     ftxui
-    SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/ftxui-src
+    GIT_REPOSITORY https://github.com/ArthurSonzogni/FTXUI.git
+    GIT_TAG        v6.1.9
+    GIT_SHALLOW    TRUE
 )
 
-# nlohmann/json - JSON 解析（使用本地已下载的源码）
+# nlohmann/json 3.12.0 - JSON 解析
 FetchContent_Declare(
     json
-    SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/json-src
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG        v3.12.0
+    GIT_SHALLOW    TRUE
 )
 
-# yaml-cpp - YAML 配置文件解析（使用本地已下载的源码）
+# yaml-cpp 0.9.0 - YAML 配置文件解析
 FetchContent_Declare(
     yaml-cpp
-    SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/yaml-cpp-src
+    GIT_REPOSITORY https://github.com/jbeder/yaml-cpp.git
+    GIT_TAG        yaml-cpp-0.9.0
+    GIT_SHALLOW    TRUE
 )
 
-# GoogleTest - 单元测试（使用本地已下载的源码）
+# GoogleTest 1.16.0 - 单元测试
 FetchContent_Declare(
     googletest
-    SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/googletest-src
+    GIT_REPOSITORY https://github.com/google/googletest.git
+    GIT_TAG        v1.16.0
+    GIT_SHALLOW    TRUE
 )
 
-# spdlog - 日志库（使用本地已下载的源码）
+# spdlog 1.15.3 - 日志库
 FetchContent_Declare(
     spdlog
-    SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/spdlog-src
+    GIT_REPOSITORY https://github.com/gabime/spdlog.git
+    GIT_TAG        v1.15.3
+    GIT_SHALLOW    TRUE
 )
 
-# 统一拉取所有依赖
+# 统一拉取所有基于 CMake 的依赖
 FetchContent_MakeAvailable(ftxui json yaml-cpp googletest spdlog)
 
 # OpenSSL - AES-CBC + RSA 加密（网易云接口加密必须）
 find_package(OpenSSL REQUIRED)
 
-# qrcodegen - 二维码生成（nayuki/QR-Code-generator，仅两个文件）
-# 使用本地已下载的源码，以 STATIC 库形式编译
-add_library(qrcodegen STATIC
-    ${CMAKE_BINARY_DIR}/_deps/qrcodegen-src/qrcodegen.cpp
+# qrcodegen - 二维码生成（nayuki/QR-Code-generator v1.8.0）
+# 该库只有两个文件，直接用 file(DOWNLOAD) 下载到 build 目录，避免触碰已弃用的
+# FetchContent_Populate。文件已存在时跳过下载，不产生重复网络请求。
+set(QRCODEGEN_VERSION "v1.8.0")
+set(QRCODEGEN_BASE_URL
+    "https://raw.githubusercontent.com/nayuki/QR-Code-generator/${QRCODEGEN_VERSION}/cpp"
 )
-target_include_directories(qrcodegen PUBLIC
-    ${CMAKE_BINARY_DIR}/_deps/qrcodegen-src
-)
+set(QRCODEGEN_DIR "${CMAKE_BINARY_DIR}/_deps/qrcodegen")
+if(NOT EXISTS "${QRCODEGEN_DIR}/qrcodegen.hpp")
+    file(DOWNLOAD "${QRCODEGEN_BASE_URL}/qrcodegen.hpp" "${QRCODEGEN_DIR}/qrcodegen.hpp"
+         STATUS _status)
+    list(GET _status 0 _code)
+    if(NOT _code EQUAL 0)
+        message(FATAL_ERROR "下载 qrcodegen.hpp 失败：${_status}")
+    endif()
+endif()
+if(NOT EXISTS "${QRCODEGEN_DIR}/qrcodegen.cpp")
+    file(DOWNLOAD "${QRCODEGEN_BASE_URL}/qrcodegen.cpp" "${QRCODEGEN_DIR}/qrcodegen.cpp"
+         STATUS _status)
+    list(GET _status 0 _code)
+    if(NOT _code EQUAL 0)
+        message(FATAL_ERROR "下载 qrcodegen.cpp 失败：${_status}")
+    endif()
+endif()
+add_library(qrcodegen STATIC "${QRCODEGEN_DIR}/qrcodegen.cpp")
+target_include_directories(qrcodegen PUBLIC "${QRCODEGEN_DIR}")
 # qrcodegen 内部不符合严格警告，单独关闭 Werror
 target_compile_options(qrcodegen PRIVATE -w)
 
