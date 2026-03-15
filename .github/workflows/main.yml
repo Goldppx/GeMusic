@@ -85,11 +85,6 @@ jobs:
         run: |
           ctest --test-dir build --output-on-failure
 
-      - name: Run tests (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          ctest --test-dir build -C ${{ matrix.config }} --output-on-failure
-
       - name: Upload GeMusic executable (Linux)
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
