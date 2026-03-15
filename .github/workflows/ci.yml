@@ -13,6 +13,10 @@ jobs:
   build:
     name: Build on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    env:
+      # 为应对 Node.js 20 的弃用警告，强制 JavaScript actions 使用 Node.js 24
+      # 这是一个短期兼容性方案；长期应升级各 action 到支持 Node.js 24 的版本
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
