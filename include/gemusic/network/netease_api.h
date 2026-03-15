@@ -82,6 +82,35 @@ auto FetchSongUrl(ApiClient& client, int64_t song_id) -> std::expected<std::stri
 // 返回: 成功时返回 LRC 文本或空字符串（无歌词），失败时返回 AppError
 auto FetchSongLyrics(ApiClient& client, int64_t song_id) -> std::expected<std::string, AppError>;
 
+// 搜索结果中单首歌曲的数据结构（与 Track 相同字段，语义上用于搜索结果展示）
+struct SearchResult {
+    // 歌曲数字 ID
+    int64_t id = 0;
+
+    // 歌曲名称
+    std::string name;
+
+    // 主要艺术家名（多艺术家时取第一个）
+    std::string artist;
+
+    // 所属专辑名
+    std::string album;
+
+    // 歌曲时长（毫秒）
+    int duration_ms = 0;
+};
+
+// 在网易云音乐搜索歌曲（需已登录）
+// 使用 /weapi/cloudsearch/get/web 端点，type=1 表示单曲搜索
+// 参数:
+//   client  - 已配置 cookies 的 HTTP 客户端
+//   keyword - 搜索关键词（支持歌名、艺术家、专辑名等）
+//   limit   - 最多返回结果数量（默认 30）
+//   offset  - 分页偏移（默认 0）
+// 返回: 成功时返回搜索结果列表，失败时返回 AppError
+auto FetchSearchResults(ApiClient& client, const std::string& keyword, int limit = 30,
+                        int offset = 0) -> std::expected<std::vector<SearchResult>, AppError>;
+
 }  // namespace gemusic::network
 
 #endif  // GEMUSIC_NETWORK_NETEASE_API_H

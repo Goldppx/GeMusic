@@ -259,4 +259,91 @@ auto FetchSongLyrics(ApiClient& client, int64_t song_id) -> std::expected<std::s
     return lyric;
 }
 
+// 搜索歌曲的 Weapi 端点（type=1 表示单曲搜索）
+static constexpr std::string_view kCloudSearchEndpoint =
+    "https://music.163.com/weapi/cloudsearch/get/web";
+
+auto FetchSearchResults(ApiClient& client, const std::string& keyword, int limit, int offset)
+    -> std::expected<std::vector<SearchResult>, AppError> {
+    // 关键词为空时提前返回空列表（非错误）
+    if (keyword.empty()) {
+        return std::vector<SearchResult>{};
+    }
+
+    // 请求参数：
+    //   s      - 搜索关键词
+    //   type   - 1 表示单曲搜索
+    //   limit  - 每页结果数
+    //   offset - 分页偏移
+    const nlohmann::json params = {
+        {"s", keyword},
+        {"type", 1},
+        {"limit", limit},
+        {"offset", offset},
+    };
+
+    spdlog::debug("FetchSearchResults: 搜索关键词=\"{}\" limit={} offset={}", keyword, limit,
+                  offset);
+
+    auto result = client.PostWeapi(kCloudSearchEndpoint, params);
+    if (!result) {
+        spdlog::warn("FetchSearchResults: HTTP 请求失败: {}", result.error().message);
+        return std::unexpected(result.error());
+    }
+
+    const auto& resp = result.value();
+
+    // 校验业务响应码
+    if (!resp.json.is_object() || !resp.json.contains("code") ||
+        resp.json["code"].get<int>() != 200) {
+        const int code = resp.json.is_object() ? resp.json.value("code", -1) : -1;
+        spdlog::warn("FetchSearchResults: 服务器返回异常 code={}", code);
+        return std::unexpected(AppError{ErrorCode::kNetworkError,
+                                        "搜索失败，服务器 code=" + std::to_string(code)});
+    }
+
+    // 响应结构：result.songs 数组
+    if (!resp.json.contains("result") || !resp.json["result"].is_object()) {
+        return std::unexpected(
+            AppError{ErrorCode::kParseError, "搜索响应中缺少 result 字段或格式错误"});
+    }
+
+    const auto& result_obj = resp.json["result"];
+    if (!result_obj.contains("songs") || !result_obj["songs"].is_array()) {
+        // 关键词无匹配时服务器可能省略 songs 字段，视为空结果
+        spdlog::info("FetchSearchResults: 关键词\"{}\"无匹配结果", keyword);
+        return std::vector<SearchResult>{};
+    }
+
+    std::vector<SearchResult> songs;
+    const auto& arr = result_obj["songs"];
+    songs.reserve(arr.size());
+
+    for (const auto& item : arr) {
+        if (!item.is_object()) {
+            continue;
+        }
+
+        SearchResult sr;
+        sr.id = item.value("id", int64_t{0});
+        sr.name = item.value("name", std::string{});
+        sr.duration_ms = item.value("dt", 0);
+
+        // 取第一个艺术家名（ar 数组）
+        if (item.contains("ar") && item["ar"].is_array() && !item["ar"].empty()) {
+            sr.artist = item["ar"][0].value("name", std::string{});
+        }
+
+        // 专辑名（al 对象）
+        if (item.contains("al") && item["al"].is_object()) {
+            sr.album = item["al"].value("name", std::string{});
+        }
+
+        songs.push_back(std::move(sr));
+    }
+
+    spdlog::info("FetchSearchResults: 关键词\"{}\"返回 {} 条结果", keyword, songs.size());
+    return songs;
+}
+
 }  // namespace gemusic::network

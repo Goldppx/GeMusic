@@ -44,6 +44,46 @@ struct AppUi::Impl {
         "播放列表", "搜索", "我的歌单", "本地文件", "设置",
     };
 
+    // ── 搜索页面状态 ──
+    // 搜索输入框绑定值（Input 组件直接修改此字符串）
+    std::string search_input_value_;
+    // 上一次提交的搜索关键词（区分"正在展示哪次搜索结果"）
+    std::string search_last_keyword_;
+    // 搜索结果列表（受 search_mutex_ 保护，后台线程写入，UI 线程只读）
+    std::vector<network::SearchResult> search_results_;
+    // 供 FTXUI Menu 组件使用的显示名称列表（格式："歌名 - 艺术家"）
+    std::vector<std::string> search_result_names_;
+    // 当前在搜索结果中选中的条目索引
+    int selected_search_result_ = 0;
+    // 状态提示文字（"搜索中..." / "共 N 条结果" / 错误信息）
+    std::string search_status_;
+    // true 表示后台搜索请求正在进行中
+    bool search_loading_ = false;
+    // 保护搜索数据的互斥锁
+    mutable std::mutex search_mutex_;
+    // 搜索专用 HTTP 客户端（独立实例，避免与其他请求竞争）
+    network::ApiClient search_api_client_{"", ""};
+    // 搜索结果列表可见条目的屏幕坐标范围（鼠标命中检测用）
+    std::vector<Box> search_item_boxes_;
+    // 搜索结果列表可见区域的屏幕包围盒（reflect 写入，用于计算可见行数）
+    Box search_list_area_box_;
+    // 搜索结果列表的总条目数（render 时写入，CatchEvent 中读取用于 WheelDown 上界）
+    int search_total_ = 0;
+    // 搜索结果列表当前滚动偏移（可见区域第一行对应的全局索引）
+    int search_scroll_top_ = 0;
+    // 搜索输入框组件（在 Run() 中初始化，供 BuildSearchContent 调用 Render()）
+    Component search_input_component_;
+    // 搜索结果列表菜单组件（在 Run() 中初始化，供 ESC 时将焦点从输入框移至列表）
+    Component search_results_menu_component_;
+
+    // ── 搜索分页状态 ──
+    // 下一次加载的偏移量（等于已加载结果总数），每次新搜索时重置为 0
+    int search_loaded_offset_ = 0;
+    // 是否还有更多结果可加载（返回条数 < 30 时置 false）
+    std::atomic<bool> search_has_more_{true};
+    // 是否正在加载更多结果（防止重复触发分页请求）
+    std::atomic<bool> search_loading_more_{false};
+
     // 本地文件页面的状态
     std::vector<std::string> local_file_names;      // 显示用的文件名列表
     std::vector<library::LocalTrack> local_tracks;  // 完整的文件信息
@@ -986,14 +1026,316 @@ struct AppUi::Impl {
     // 根据当前选中的菜单项显示对应的页面内容
     // 注意：此方法仅供占位页面使用，交互页面（本地文件、设置）
     //       通过 Renderer(component, fn) 包装，在 Run() 中直接渲染
-    auto BuildPlaceholderContent() -> Element {
-        const std::string page_name = menu_entries[static_cast<size_t>(selected_menu)];
+    // 搜索页面内容渲染方法
+    // 由顶部搜索输入框和下方可滚动结果列表两部分构成：
+    //   - 顶部：[搜索] 标题 + 搜索框（由外部传入的 Input 组件渲染）+ 状态提示
+    //   - 下方：与「我的歌单」曲目列表相同的手动滚动列表
+    // 调用方须已在 Run() 中初始化 search_input_component_
+    auto BuildSearchContent() -> Element {
+        Elements header;
+        header.push_back(text("搜索") | bold | center);
+        header.push_back(separator());
+
+        // 搜索输入框行：[前缀标签] + [Input 组件] + [快捷键提示]
+        if (static_cast<bool>(search_input_component_)) {
+            header.push_back(hbox({
+                text("关键词: ") | bold,
+                search_input_component_->Render() | flex,
+                text("  Enter: 搜索") | dim,
+            }));
+        } else {
+            header.push_back(text("关键词: ") | bold);
+        }
+        header.push_back(separator());
+
+        // 状态提示（空时显示引导文字；加载更多时追加提示）
+        std::string status_line;
+        if (search_status_.empty()) {
+            status_line = "输入关键词后按 Enter 开始搜索";
+        } else if (search_loading_more_.load()) {
+            status_line = search_status_ + "  正在加载更多...";
+        } else {
+            status_line = search_status_;
+        }
+        header.push_back(text(status_line) | dim);
+
+        // 记录总条目数，供 CatchEvent 中 WheelDown 上界使用
+        search_total_ = static_cast<int>(search_results_.size());
+
+        // 当选中项接近列表末尾（最后 5 项之内）时，自动触发加载下一页
+        // 使用 search_loading_more_ 原子标志确保不重复触发
+        if (search_has_more_.load() && !search_loading_more_.load() && !search_loading_ &&
+            search_total_ > 0 && selected_search_result_ >= search_total_ - 5) {
+            LoadMoreSearchResults(screen);
+        }
+
+        if (search_results_.empty()) {
+            return vbox({
+                       vbox(std::move(header)),
+                       filler(),
+                       vbox({
+                           separator(),
+                           text("Enter: 播放  a: 加入队列") | dim,
+                       }),
+                   }) |
+                   flex;
+        }
+
+        // 可见区域行数（由上一帧 reflect 写入的 Box 计算）
+        const int area_h = search_list_area_box_.y_max - search_list_area_box_.y_min + 1;
+        // 首帧 Box 未初始化（全 0 → area_h == 1），fallback 为显示全部
+        const int visible_rows = (area_h <= 2) ? search_total_ : area_h;
+
+        // 根据当前选中项调整滚动偏移
+        AdjustScroll(selected_search_result_, visible_rows, search_total_, search_scroll_top_);
+
+        // 可滚动的结果条目列表（只渲染可见切片）
+        Elements list_items;
+        const int end = std::min(search_scroll_top_ + visible_rows, search_total_);
+        const int slice = end - search_scroll_top_;
+        // 确保包围盒向量长度与可见行数同步（局部索引）
+        search_item_boxes_.resize(static_cast<size_t>(slice));
+        for (int li = 0; li < slice; ++li) {
+            const int gi = search_scroll_top_ + li;  // 全局索引
+            const auto& sr = search_results_[static_cast<size_t>(gi)];
+            // 歌名正常颜色，艺术家/专辑名显示为灰色
+            Elements parts;
+            parts.push_back(text(sr.name));
+            if (!sr.artist.empty()) {
+                parts.push_back(text(" - " + sr.artist));
+            }
+            if (!sr.album.empty()) {
+                parts.push_back(text("  [" + sr.album + "]") | dim);
+            }
+            // reflect：将该条目屏幕坐标写入 search_item_boxes_[li]，供鼠标命中检测
+            auto row = hbox(std::move(parts)) | xflex |
+                       reflect(search_item_boxes_[static_cast<size_t>(li)]);
+            if (gi == selected_search_result_) {
+                row = row | inverted;
+            }
+            list_items.push_back(row);
+        }
+
+        Elements footer;
+        footer.push_back(separator());
+        footer.push_back(text("Enter: 替换并播放  a: 加入队列  Esc: 回到输入框") | dim);
+
+        // flex + reflect：分配剩余空间并记录实际高度，供下一帧计算可见行数
         return vbox({
-                   text(page_name) | bold | center,
+                   vbox(std::move(header)),
                    separator(),
-                   text("功能开发中...") | dim | center,
+                   vbox(std::move(list_items)) | flex | reflect(search_list_area_box_),
+                   vbox(std::move(footer)),
                }) |
                flex;
+    }
+
+    // 在后台线程中执行搜索请求
+    // 完成后通过 screen_ref.PostEvent(Custom) 触发 UI 刷新
+    // 参数: keyword     - 搜索关键词（允许中英文）
+    //       screen_ref  - FTXUI 屏幕引用（用于 PostEvent）
+    void SubmitSearch(const std::string& keyword, ScreenInteractive& screen_ref) {
+        {
+            const std::lock_guard<std::mutex> lock(search_mutex_);
+            // 关键词无变化且已有结果时直接返回（避免重复请求）
+            if (keyword == search_last_keyword_ && !search_results_.empty()) {
+                return;
+            }
+            // 关键词为空时清空结果，不发网络请求
+            if (keyword.empty()) {
+                search_results_.clear();
+                search_result_names_.clear();
+                search_status_.clear();
+                selected_search_result_ = 0;
+                search_scroll_top_ = 0;
+                search_loaded_offset_ = 0;
+                search_has_more_ = true;
+                return;
+            }
+            if (search_loading_) {
+                return;
+            }
+            search_loading_ = true;
+            search_last_keyword_ = keyword;
+            // 新关键词：重置分页状态
+            search_loaded_offset_ = 0;
+            search_has_more_ = true;
+            search_loading_more_ = false;
+            search_status_ = "搜索中...";
+        }
+        // 让"搜索中..."立即显示
+        screen_ref.PostEvent(ftxui::Event::Custom);
+
+        // 在独立线程中发起网络请求，避免阻塞渲染线程
+        std::thread([this, keyword, &screen_ref] {
+            // 将已登录的 cookies 同步到搜索专用客户端
+            search_api_client_.SetCookies(settings.cookies);
+
+            auto result = network::FetchSearchResults(search_api_client_, keyword);
+
+            {
+                const std::lock_guard<std::mutex> lock(search_mutex_);
+                search_loading_ = false;
+                selected_search_result_ = 0;
+                search_scroll_top_ = 0;
+
+                if (!result) {
+                    search_status_ = "搜索失败: " + result.error().message;
+                    search_results_.clear();
+                    search_result_names_.clear();
+                    search_has_more_ = false;
+                } else {
+                    search_results_ = std::move(result.value());
+                    search_result_names_.clear();
+                    search_result_names_.reserve(search_results_.size());
+                    for (const auto& sr : search_results_) {
+                        std::string disp = sr.name;
+                        if (!sr.artist.empty()) {
+                            disp += " - " + sr.artist;
+                        }
+                        if (!sr.album.empty()) {
+                            disp += "  [" + sr.album + "]";
+                        }
+                        search_result_names_.push_back(std::move(disp));
+                    }
+                    if (search_results_.empty()) {
+                        search_status_ = "未找到相关结果";
+                        search_has_more_ = false;
+                    } else {
+                        // 记录已加载条数（首页）；不足 30 条说明没有更多
+                        search_loaded_offset_ = static_cast<int>(search_results_.size());
+                        if (search_loaded_offset_ < 30) {
+                            search_has_more_ = false;
+                        }
+                        search_status_ = "共 " + std::to_string(search_results_.size()) + " 条结果";
+                    }
+                }
+            }
+            // 通知 UI 刷新
+            screen_ref.PostEvent(ftxui::Event::Custom);
+        }).detach();
+    }
+
+    // 搜索分页：追加加载下一页结果（offset = search_loaded_offset_）
+    // 由 BuildSearchContent 在选中项接近末尾时自动触发，或可手动调用
+    // 使用 search_loading_more_ 原子标志防止重复触发
+    void LoadMoreSearchResults(ScreenInteractive& screen_ref) {
+        std::string keyword;
+        int offset = 0;
+        {
+            const std::lock_guard<std::mutex> lock(search_mutex_);
+            // 正在加载（首页或分页）、已无更多、关键词为空时直接跳过
+            if (search_loading_ || search_loading_more_.load() || !search_has_more_.load() ||
+                search_last_keyword_.empty()) {
+                return;
+            }
+            search_loading_more_ = true;
+            keyword = search_last_keyword_;
+            offset = search_loaded_offset_;
+        }
+
+        std::thread([this, keyword, offset, &screen_ref] {
+            search_api_client_.SetCookies(settings.cookies);
+            auto result = network::FetchSearchResults(search_api_client_, keyword, 30, offset);
+
+            {
+                const std::lock_guard<std::mutex> lock(search_mutex_);
+                search_loading_more_ = false;
+
+                if (!result || result.value().empty()) {
+                    // 请求失败或无更多数据
+                    search_has_more_ = false;
+                } else {
+                    auto& new_songs = result.value();
+                    // 不足 30 条说明已是最后一页
+                    if (static_cast<int>(new_songs.size()) < 30) {
+                        search_has_more_ = false;
+                    }
+                    search_loaded_offset_ += static_cast<int>(new_songs.size());
+                    for (const auto& sr : new_songs) {
+                        std::string disp = sr.name;
+                        if (!sr.artist.empty()) {
+                            disp += " - " + sr.artist;
+                        }
+                        if (!sr.album.empty()) {
+                            disp += "  [" + sr.album + "]";
+                        }
+                        search_results_.push_back(sr);
+                        search_result_names_.push_back(std::move(disp));
+                    }
+                    search_status_ = "共 " + std::to_string(search_results_.size()) + " 条结果" +
+                                     (search_has_more_.load() ? "" : "（已全部加载）");
+                }
+            }
+            screen_ref.PostEvent(ftxui::Event::Custom);
+        }).detach();
+    }
+
+    // 搜索结果页面：Enter 键——用全部搜索结果替换播放队列，从选中曲目开始播放
+    void PlaySearchResultFromList(ScreenInteractive& screen_ref) {
+        std::vector<network::SearchResult> snapshot;
+        int start = 0;
+        {
+            const std::lock_guard<std::mutex> lock(search_mutex_);
+            if (search_results_.empty()) {
+                return;
+            }
+            snapshot = search_results_;
+            start = selected_search_result_;
+        }
+        // 将 SearchResult 转为 QueueEntry（与 ReplaceQueueWithTracks 相同逻辑）
+        {
+            const std::lock_guard<std::mutex> lock(queue_mutex_);
+            play_queue_.clear();
+            play_queue_.reserve(snapshot.size());
+            for (const auto& sr : snapshot) {
+                std::string name = sr.name;
+                if (!sr.artist.empty()) {
+                    name += " - " + sr.artist;
+                }
+                play_queue_.push_back(QueueEntry{sr.id, std::move(name), ""});
+            }
+            current_queue_index_ = -1;
+            selected_queue_track_ =
+                std::clamp(start, 0, std::max(0, static_cast<int>(play_queue_.size()) - 1));
+            SyncQueueDisplayNames();
+        }
+        PlayQueueAt(start, screen_ref);
+    }
+
+    // 搜索结果页面：a 键——将选中曲目追加到播放队列末尾；若队列为空则立即播放
+    void AppendSearchResultToQueue(ScreenInteractive& screen_ref) {
+        network::SearchResult sr;
+        {
+            const std::lock_guard<std::mutex> lock(search_mutex_);
+            if (search_results_.empty()) {
+                return;
+            }
+            const auto idx = static_cast<size_t>(selected_search_result_);
+            if (idx >= search_results_.size()) {
+                return;
+            }
+            sr = search_results_[idx];
+        }
+        std::string name = sr.name;
+        if (!sr.artist.empty()) {
+            name += " - " + sr.artist;
+        }
+        bool was_empty = false;
+        int new_idx = 0;
+        {
+            const std::lock_guard<std::mutex> lock(queue_mutex_);
+            was_empty = play_queue_.empty();
+            play_queue_.push_back(QueueEntry{sr.id, name, ""});
+            new_idx = static_cast<int>(play_queue_.size()) - 1;
+            SyncQueueDisplayNames();
+        }
+        if (was_empty) {
+            PlayQueueAt(new_idx, screen_ref);
+        } else {
+            queue_status_ = "已加入队列: " + name;
+            screen_ref.PostEvent(ftxui::Event::Custom);
+        }
     }
 
     // 本地文件页面内容
@@ -1697,6 +2039,13 @@ void AppUi::Run() {
     // Container::Tab 确保只有激活标签的子组件接收焦点与事件
     auto settings_buttons = Container::Tab({normal_buttons, form_container, cookie_form_container},
                                            &impl_->password_form_tab_);
+    // 搜索页面输入框：Enter 键触发 SubmitSearch，将输入值提交为搜索关键词
+    {
+        InputOption search_opt;
+        search_opt.placeholder = "请输入歌名、艺术家或专辑名";
+        impl_->search_input_component_ = Input(&impl_->search_input_value_, search_opt);
+    }
+
     // 构建左侧菜单组件
     auto menu = impl_->BuildMenu();
 
@@ -1714,8 +2063,15 @@ void AppUi::Run() {
     // 这样确保组件树（事件/焦点）与渲染树（Element）保持对齐，
     // 解决直接调用 BuildXxx() 导致的渲染链断裂、按钮无法获取焦点的问题。
 
-    // 占位页面：搜索功能待实现
-    auto placeholder_search = Renderer([this] { return impl_->BuildPlaceholderContent(); });
+    // 搜索页面：search_input_component_ 负责输入框焦点管理与 Enter 事件，
+    // search_results_menu 负责结果列表上下键导航（维护 selected_search_result_），
+    // search_nav 通过 Container::Vertical 将两者串联，使 Tab 键可在输入框和列表间切换。
+    // Renderer 包装后提供完整的自定义渲染（输入框 + 结果列表 + 状态提示）。
+    // search_results_menu_component_ 存入 impl_ 供 CatchEvent 中 ESC 时转移焦点使用。
+    auto search_results_menu = Menu(&impl_->search_result_names_, &impl_->selected_search_result_);
+    impl_->search_results_menu_component_ = search_results_menu;
+    auto search_nav = Container::Vertical({impl_->search_input_component_, search_results_menu});
+    auto search_page = Renderer(search_nav, [this] { return impl_->BuildSearchContent(); });
 
     // 我的歌单页面：两层导航
     //   - playlists_menu：歌单列表视图的上下键导航（维护 selected_playlist_）
@@ -1742,11 +2098,11 @@ void AppUi::Run() {
     // 右侧内容区域的组件容器（Tab 页由 selected_menu 索引控制）
     auto content_container = Container::Tab(
         {
-            queue_page,          // 0: 播放列表（当前播放队列）
-            placeholder_search,  // 1: 搜索（待实现）
-            my_playlists_page,   // 2: 我的歌单（带 playlists_menu 交互）
-            local_files_page,    // 3: 本地文件（带 local_menu 交互）
-            settings_page,       // 4: 设置（带 settings_buttons 交互）
+            queue_page,         // 0: 播放列表（当前播放队列）
+            search_page,        // 1: 搜索（输入框 + 结果列表）
+            my_playlists_page,  // 2: 我的歌单（带 playlists_menu 交互）
+            local_files_page,   // 3: 本地文件（带 local_menu 交互）
+            settings_page,      // 4: 设置（带 settings_buttons 交互）
         },
         &impl_->selected_menu);
 
@@ -1875,6 +2231,13 @@ void AppUi::Run() {
             return false;
         }
 
+        // 搜索页面输入框聚焦时，屏蔽全局字符快捷键（防止 q/[/]/space/l/+/- 等误触），
+        // 将字符事件透传给输入框组件处理
+        if (impl_->selected_menu == 1 && static_cast<bool>(impl_->search_input_component_) &&
+            impl_->search_input_component_->Focused() && event.is_character()) {
+            return false;
+        }
+
         // q 键退出程序
         if (event == Event::Character('q')) {
             impl_->screen.Exit();
@@ -1991,6 +2354,76 @@ void AppUi::Run() {
                         if (event.mouse().button == Mouse::Left &&
                             event.mouse().motion == Mouse::Released) {
                             impl_->PlayQueueAt(impl_->selected_queue_track_, impl_->screen);
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // ── 搜索页面 ──
+        if (impl_->selected_menu == 1) {
+            // 输入框聚焦时
+            if (static_cast<bool>(impl_->search_input_component_) &&
+                impl_->search_input_component_->Focused()) {
+                if (event == Event::Return) {
+                    // Enter：提交搜索，消费事件防止换行，并立即将焦点移到结果列表
+                    impl_->SubmitSearch(impl_->search_input_value_, impl_->screen);
+                    if (static_cast<bool>(impl_->search_results_menu_component_)) {
+                        impl_->search_results_menu_component_->TakeFocus();
+                    }
+                    return true;
+                }
+                // 其余非字符事件（Backspace、左右方向键等）透传；字符事件已由上方守卫处理
+                return false;
+            }
+            // 结果列表聚焦时
+            // ArrowUp 在第 0 项且结果列表聚焦时：屏蔽，防止 Container::Vertical 将焦点转移到输入框
+            // 只有鼠标点击或 ESC 能将焦点移回输入框；不屏蔽主菜单侧栏的 ArrowUp 导航
+            if (event == Event::ArrowUp && impl_->selected_search_result_ == 0 &&
+                static_cast<bool>(impl_->search_results_menu_component_) &&
+                impl_->search_results_menu_component_->Focused()) {
+                return true;
+            }
+            if (event == Event::Escape) {
+                // ESC：焦点回到搜索输入框
+                if (static_cast<bool>(impl_->search_input_component_)) {
+                    impl_->search_input_component_->TakeFocus();
+                }
+                return true;
+            }
+            if (event == Event::Return) {
+                // Enter：将当前选中结果替换并播放
+                impl_->PlaySearchResultFromList(impl_->screen);
+                return true;
+            }
+            if (event == Event::Character('a')) {
+                // a：将当前选中搜索结果追加到播放队列
+                impl_->AppendSearchResultToQueue(impl_->screen);
+                return true;
+            }
+            // 鼠标事件：hover 高亮 + 滚轮滚动 + 单击播放
+            // search_item_boxes_ 为局部索引，实际全局索引 = search_scroll_top_ + 局部索引
+            if (event.is_mouse()) {
+                if (event.mouse().button == Mouse::WheelUp) {
+                    impl_->selected_search_result_ =
+                        std::max(0, impl_->selected_search_result_ - 1);
+                    return true;
+                }
+                if (event.mouse().button == Mouse::WheelDown) {
+                    impl_->selected_search_result_ =
+                        std::min(impl_->search_total_ - 1, impl_->selected_search_result_ + 1);
+                    return true;
+                }
+                const int mx = event.mouse().x;
+                const int my = event.mouse().y;
+                for (size_t li = 0; li < impl_->search_item_boxes_.size(); ++li) {
+                    if (impl_->search_item_boxes_[li].Contain(mx, my)) {
+                        impl_->selected_search_result_ =
+                            impl_->search_scroll_top_ + static_cast<int>(li);
+                        if (event.mouse().button == Mouse::Left &&
+                            event.mouse().motion == Mouse::Released) {
+                            impl_->PlaySearchResultFromList(impl_->screen);
                         }
                         return true;
                     }
