@@ -25,9 +25,20 @@ jobs:
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
-          # 安装基本构建工具。项目的第三方依赖通过 FetchContent 管理，通常不需要额外包。
+          # 安装基本构建工具和 libcurl 开发包，解决 curl/curl.h 丢失的问题
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake
+          sudo apt-get install -y build-essential cmake libcurl4-openssl-dev
+
+      - name: Setup vcpkg and install libcurl (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # 在 Windows 上使用 vcpkg 安装 libcurl 开发包，供 CMake 使用
+          $vcpkgDir = "$env:RUNNER_TEMP\\vcpkg"
+          git clone https://github.com/microsoft/vcpkg.git $vcpkgDir
+          & "$vcpkgDir\\bootstrap-vcpkg.bat"
+          & "$vcpkgDir\\vcpkg" install curl:x64-windows
+          Write-Host "::set-env name=VCPKG_ROOT::$vcpkgDir"
 
       - name: Configure CMake
         run: |
