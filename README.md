@@ -3,6 +3,7 @@
 一个运行在终端里的网易云音乐播放器，基于 FTXUI 构建 TUI 界面，支持在线播放、歌单管理、本地音乐库和歌词显示。
 
 ![在tty运行的GeMusic](assets/images/photo_tty.png)
+使用kmscon在tty界面运行的GeMusic
 
 ---
 
@@ -120,7 +121,10 @@ cd build && ctest --output-on-failure
 ## 更多图片展示
 
 ![在kitty运行时可以自动取色](assets/images/screenshot_color.png)
+在kitty运行时可以自动取色
 
 ![自动滚动的歌词显示](assets/images/screenshot_lyrics.png)
+在线获取网易云音乐的歌曲歌词数据并且滚动显示（可开关）
 
-![二维码登录](assets/images/screenshot_qrcode.png)
+![二维码登录](assets/images/screenshot_qrcode.png)  
+生成登录使用的二维码
