@@ -99,3 +99,21 @@ cd build && ctest --output-on-failure
 ## 许可证
 
 [Apache License 2.0](LICENSE)
+
+## 第三方依赖许可声明
+
+本项目遵循 Apache‑2.0 许可。项目中使用和/或捆绑了若干第三方开源库，以下为主要依赖及其许可证：
+
+- FTXUI — MIT (licenses/FTXUI.MIT.txt)
+- nlohmann/json — MIT (licenses/nlohmann_json.MIT.txt)
+- yaml-cpp — MIT (licenses/yaml-cpp.MIT.txt)
+- spdlog — MIT (licenses/spdlog.MIT.txt) （依赖 fmt，fmt 为 MIT）
+- miniaudio — Public Domain or MIT-0 (licenses/miniaudio.LICENSE.txt)
+- qrcodegen (Project Nayuki) — MIT (见源码头注释，licenses/qrcodegen.MAYBE.txt)
+- GoogleTest — BSD (licenses/googletest.BSD.txt)
+- OpenSSL — Apache 2.0 (licenses/OpenSSL.LICENSE.txt)
+- libcurl (curl) — curl license (licenses/curl.COPYING.txt)
+
+完整的第三方许可证文本见仓库目录 `licenses/`。在分发二进制或打包时，请一并包含 `licenses/` 目录以满足各开源许可证的要求。
+
+如需对某个依赖的许可证有疑问，请指出具体库名，我会补充更详细的来源与说明。
