@@ -38,12 +38,22 @@ jobs:
           git clone https://github.com/microsoft/vcpkg.git $vcpkgDir
           & "$vcpkgDir\\bootstrap-vcpkg.bat"
           & "$vcpkgDir\\vcpkg" install curl:x64-windows
-          Write-Host "::set-env name=VCPKG_ROOT::$vcpkgDir"
+          # 不再使用已弃用的 set-env 命令，改为写入环境文件以导出 VCPKG_ROOT
+          Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_ROOT=$vcpkgDir"
 
-      - name: Configure CMake
+      - name: Configure CMake (Linux)
+        if: runner.os == 'Linux'
         run: |
           # 使用 out-of-source build 到 build/ 目录
           cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.config }}
+
+      - name: Configure CMake (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # 在 Windows 上通过 vcpkg toolchain 集成依赖
+          $toolchain = "$env:VCPKG_ROOT\\scripts\\buildsystems\\vcpkg.cmake"
+          cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.config }} -DCMAKE_TOOLCHAIN_FILE="$toolchain"
 
       - name: Build targets (Linux)
         if: runner.os == 'Linux'
