@@ -1,0 +1,53 @@
+# CI 工作流：在 Linux 和 Windows 上构建并运行测试
+# 所有注释使用中文（遵循仓库代理编码指南）
+name: CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        config: [Debug]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # 安装基本构建工具。项目的第三方依赖通过 FetchContent 管理，通常不需要额外包。
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake
+
+      - name: Configure CMake
+        run: |
+          # 使用 out-of-source build 到 build/ 目录
+          cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.config }}
+
+      - name: Build targets
+        run: |
+          # 对于单/多配置构建，cmake --build 会根据平台自动选择正确的构建方式
+          cmake --build build --config ${{ matrix.config }} -- -j
+
+      - name: Build tests target (if present)
+        run: |
+          cmake --build build --config ${{ matrix.config }} --target tests -- -j || true
+
+      - name: Run tests
+        run: |
+          # 在构建目录运行 ctest；Windows 上使用 -C 指定配置
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            ctest --test-dir build -C ${{ matrix.config }} --output-on-failure
+          else
+            ctest --test-dir build --output-on-failure
+          fi
