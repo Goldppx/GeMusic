@@ -91,3 +91,31 @@ jobs:
         run: |
           # 在 Windows 上使用 -C 指定配置
           ctest --test-dir build -C ${{ matrix.config }} --output-on-failure
+
+      - name: Upload GeMusic executable (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: GeMusic-linux
+          path: build/GeMusic
+
+      - name: Upload test executable (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test_json_parser-linux
+          path: build/tests/test_json_parser
+
+      - name: Upload GeMusic executable (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: GeMusic-windows
+          path: build/GeMusic.exe
+
+      - name: Upload test executable (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test_json_parser-windows
+          path: build/tests/test_json_parser.exe
