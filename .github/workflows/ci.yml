@@ -34,20 +34,35 @@ jobs:
           # 使用 out-of-source build 到 build/ 目录
           cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.config }}
 
-      - name: Build targets
+      - name: Build targets (Linux)
+        if: runner.os == 'Linux'
         run: |
-          # 对于单/多配置构建，cmake --build 会根据平台自动选择正确的构建方式
+          # 在 Linux 上使用 -j 来并行构建
           cmake --build build --config ${{ matrix.config }} -- -j
 
-      - name: Build tests target (if present)
+      - name: Build targets (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          # 在 Windows (MSBuild) 上使用 /m 开启多核并行构建；不要传递 -j（MSBuild 不支持）
+          cmake --build build --config ${{ matrix.config }} -- /m
+
+      - name: Build tests target (Linux, if present)
+        if: runner.os == 'Linux'
         run: |
           cmake --build build --config ${{ matrix.config }} --target tests -- -j || true
 
-      - name: Run tests
+      - name: Build tests target (Windows, if present)
+        if: runner.os == 'Windows'
         run: |
-          # 在构建目录运行 ctest；Windows 上使用 -C 指定配置
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            ctest --test-dir build -C ${{ matrix.config }} --output-on-failure
-          else
-            ctest --test-dir build --output-on-failure
-          fi
+          cmake --build build --config ${{ matrix.config }} --target tests -- /m || exit 0
+
+      - name: Run tests (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          ctest --test-dir build --output-on-failure
+
+      - name: Run tests (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          # 在 Windows 上使用 -C 指定配置
+          ctest --test-dir build -C ${{ matrix.config }} --output-on-failure
