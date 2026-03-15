@@ -40,8 +40,12 @@ jobs:
       - name: Install build dependencies (Linux ARM64 Cross-Compile)
         if: runner.os == 'Linux' && matrix.arch == 'arm64'
         run: |
+          sudo dpkg --add-architecture arm64
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libcurl4-openssl-dev
+          # 安装交叉编译器
+          sudo apt-get install -y build-essential cmake gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          # 安装 ARM64 版本的 libcurl 依赖
+          sudo apt-get install -y libcurl4-openssl-dev:arm64
 
       - name: Setup vcpkg and install libcurl (Windows)
         if: runner.os == 'Windows'
