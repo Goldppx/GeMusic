@@ -2187,8 +2187,14 @@ void AppUi::Run() {
     // 注意：渲染时仍直接调用 seek_slider->Render()，不通过 Maybe，
     // 以确保 reflect(gauge_box_) 在播放时能正确追踪屏幕位置
     auto show_seek = [this] {
+        // 仅在播放器处于 Playing/Paused 且当前没有进行搜索分页加载时，
+        // 允许进度条获得焦点。搜索分页加载（search_loading_more_）期间
+        // 进度条从组件树中移除，避免长按 ArrowDown 导致焦点跳到进度条上。
         const auto s = impl_->player.GetState();
-        return s == player::PlayerState::kPlaying || s == player::PlayerState::kPaused;
+        if (!(s == player::PlayerState::kPlaying || s == player::PlayerState::kPaused)) {
+            return false;
+        }
+        return !impl_->search_loading_more_.load();
     };
     auto seek_slider_maybe = Maybe(seek_slider, show_seek);
 

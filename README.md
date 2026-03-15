@@ -2,8 +2,7 @@
 
 一个运行在终端里的网易云音乐播放器，基于 FTXUI 构建 TUI 界面，支持在线播放、歌单管理、本地音乐库和歌词显示。
 
-> **截图**
-> *(图片待补充)*
+![在tty运行的GeMusic](assets/images/photo_tty.png)
 
 ---
 
@@ -16,13 +15,13 @@ GeMusic 的目标是：在不离开终端的前提下，完整使用网易云音
 
 ## 功能
 
-- 扫码登录 / 账密登录 / Cookie 登录
+- 扫码登录 / 账密登录 / Cookie 登录 (目前没有解决网易云风控问题，只能使用cookie登录)
 - 获取并浏览我的歌单，播放任意曲目
-- **在线搜索**：按歌名、艺术家或专辑名搜索，支持分页自动加载
+- 在线搜索：搜索，支持分页自动加载
 - 播放队列管理（替换、追加、移除）
 - 本地音乐库扫描与播放（支持 mp3、flac、wav、ogg 等格式）
 - 歌词面板，支持拖拽调整宽度，自动滚动高亮当前行
-- 进度条拖拽 seek，音量调节
+- 进度条拖拽，音量调节
 - 音频缓存，已播放过的歌曲再次播放无需重新下载
 - 配置文件持久化保存至 `~/.config/GeMusic/config.yaml`
 
@@ -117,3 +116,11 @@ cd build && ctest --output-on-failure
 完整的第三方许可证文本见仓库目录 `licenses/`。在分发二进制或打包时，请一并包含 `licenses/` 目录以满足各开源许可证的要求。
 
 如需对某个依赖的许可证有疑问，请指出具体库名，我会补充更详细的来源与说明。
+
+## 更多图片展示
+
+![在kitty运行时可以自动取色](assets/images/screenshot_color.png)
+
+![自动滚动的歌词显示](assets/images/screenshot_lyrics.png)
+
+![二维码登录](assets/images/screenshot_qrcode.png)
