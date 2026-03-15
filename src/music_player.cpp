@@ -1,5 +1,6 @@
 #include "gemusic/player/music_player.h"
 
+#include <algorithm>
 #include <iostream>
 #include <mutex>
 

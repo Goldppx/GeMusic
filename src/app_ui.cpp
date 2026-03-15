@@ -1,5 +1,6 @@
 #include "gemusic/ui/app_ui.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>

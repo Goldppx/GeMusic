@@ -129,6 +129,9 @@ endif()
 # --- OpenSSL - AES-CBC + RSA 加密（网易云接口加密必须）---
 find_package(OpenSSL REQUIRED)
 
+# 查找 libcurl（在 Linux 安装 libcurl4-openssl-dev 或在 Windows 通过 vcpkg 提供）
+find_package(CURL REQUIRED)
+
 # --- qrcodegen - 二维码生成（nayuki/QR-Code-generator v1.8.0）---
 # 该库只有两个文件，直接用 file(DOWNLOAD) 下载到 build 目录，避免触碰已弃用的
 # FetchContent_Populate。文件已存在时跳过下载，不产生重复网络请求。
@@ -180,14 +183,18 @@ target_link_libraries(GeMusic PRIVATE
     OpenSSL::Crypto
     qrcodegen
     spdlog::spdlog
-    curl
-    pthread
+    CURL::libcurl
+    $<$<PLATFORM_ID:Linux>:pthread>
 )
 
-# 编译警告（严格模式）
-target_compile_options(GeMusic PRIVATE
-    -Wall -Wextra -Wpedantic -Werror
-)
+# 编译警告（严格模式），根据不同编译器设置不同选项
+if(MSVC)
+    # MSVC 使用 /W4 开启较严格警告，/WX 将警告视为错误
+    target_compile_options(GeMusic PRIVATE /W4 /WX)
+else()
+    # 对于 GCC/Clang 使用常见的警告选项
+    target_compile_options(GeMusic PRIVATE -Wall -Wextra -Wpedantic -Werror)
+endif()
 
 # ============================================================
 # 测试目标
@@ -216,9 +223,9 @@ if(TEST_SOURCES)
         ftxui::component
         OpenSSL::Crypto
         qrcodegen
-        spdlog::spdlog
-        curl
-        pthread
+    spdlog::spdlog
+    CURL::libcurl
+    $<$<PLATFORM_ID:Linux>:pthread>
     )
 
     include(GoogleTest)
