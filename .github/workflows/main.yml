@@ -97,4 +97,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: GeMusic-windows
-          path: build/GeMusic.exe
+          path: build/**/GeMusic.exe
