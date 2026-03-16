@@ -36,6 +36,10 @@ struct Settings {
     // 设备唯一标识符（52 位大写十六进制，首次启动时随机生成并持久化）
     // 用于构造二维码 URL 中的 chainId 参数，绕过网易云 8821 风控
     std::string s_device_id;
+    // 播放模式：0=顺序播放（默认），1=单曲循环，2=随机播放
+    // 在配置文件中以整数形式保存（参见 src/settings.cpp 的注释）
+    // 变更此字段会影响队列的 Next/Prev 行为
+    int play_mode = 0;
 };
 
 // 从 YAML 文件加载配置

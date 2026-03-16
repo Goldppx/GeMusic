@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -149,6 +150,10 @@ struct AppUi::Impl {
     int selected_queue_track_ = 0;
     // 供 FTXUI Menu 组件使用的队列条目显示名称列表（与 play_queue_ 保持同步）
     std::vector<std::string> queue_display_names_;
+    // 随机模式支持：当前轮的洗牌顺序和位置（受 queue_mutex_ 保护）
+    std::mt19937 rng_{std::random_device{}()};
+    std::vector<int> shuffle_order_;
+    int shuffle_pos_ = -1;
 
     // ── 鼠标点击命中检测用的条目包围盒 ──
     // 每帧渲染时由 reflect() 写入，供 CatchEvent 中的鼠标处理逻辑查询
@@ -504,8 +509,50 @@ struct AppUi::Impl {
             const std::lock_guard<std::mutex> lock(queue_mutex_);
             if (play_queue_.empty())
                 return;
-            next = (current_queue_index_ + 1) % static_cast<int>(play_queue_.size());
+
+            // 0 = 顺序, 1 = 单曲循环, 2 = 随机
+            const int mode = settings.play_mode;
+            const int sz = static_cast<int>(play_queue_.size());
+
+            if (mode == 1) {
+                // 单曲循环：保持当前索引（若无正在播放则走顺序下一首）
+                if (current_queue_index_ < 0) {
+                    next = 0;
+                } else {
+                    next = current_queue_index_;
+                }
+            } else if (mode == 2) {
+                // 随机模式：使用 shuffle_order_
+                if (shuffle_order_.size() != static_cast<size_t>(sz)) {
+                    // 重建洗牌序列
+                    shuffle_order_.resize(sz);
+                    for (int i = 0; i < sz; ++i)
+                        shuffle_order_[i] = i;
+                    std::shuffle(shuffle_order_.begin(), shuffle_order_.end(), rng_);
+                    // 定位到当前元素在新序列中的位置
+                    shuffle_pos_ = 0;
+                    if (current_queue_index_ >= 0) {
+                        for (int i = 0; i < sz; ++i) {
+                            if (shuffle_order_[i] == current_queue_index_) {
+                                shuffle_pos_ = i;
+                                break;
+                            }
+                        }
+                    }
+                }
+                // 前进到下一位；若超出则重新洗牌开始新轮
+                shuffle_pos_++;
+                if (shuffle_pos_ >= static_cast<int>(shuffle_order_.size())) {
+                    std::shuffle(shuffle_order_.begin(), shuffle_order_.end(), rng_);
+                    shuffle_pos_ = 0;
+                }
+                next = shuffle_order_[shuffle_pos_];
+            } else {
+                // 默认顺序播放
+                next = (current_queue_index_ + 1) % sz;
+            }
         }
+
         PlayQueueAt(next, screen_ref);
     }
 
@@ -516,9 +563,42 @@ struct AppUi::Impl {
             const std::lock_guard<std::mutex> lock(queue_mutex_);
             if (play_queue_.empty())
                 return;
+            const int mode = settings.play_mode;
             const int sz = static_cast<int>(play_queue_.size());
-            prev = (current_queue_index_ - 1 + sz) % sz;
+
+            if (mode == 1) {
+                // 单曲循环：保持当前索引
+                if (current_queue_index_ < 0) {
+                    prev = 0;
+                } else {
+                    prev = current_queue_index_;
+                }
+            } else if (mode == 2) {
+                if (shuffle_order_.size() != static_cast<size_t>(sz)) {
+                    shuffle_order_.resize(sz);
+                    for (int i = 0; i < sz; ++i)
+                        shuffle_order_[i] = i;
+                    std::shuffle(shuffle_order_.begin(), shuffle_order_.end(), rng_);
+                    shuffle_pos_ = 0;
+                    if (current_queue_index_ >= 0) {
+                        for (int i = 0; i < sz; ++i) {
+                            if (shuffle_order_[i] == current_queue_index_) {
+                                shuffle_pos_ = i;
+                                break;
+                            }
+                        }
+                    }
+                }
+                shuffle_pos_--;
+                if (shuffle_pos_ < 0) {
+                    shuffle_pos_ = static_cast<int>(shuffle_order_.size()) - 1;
+                }
+                prev = shuffle_order_[shuffle_pos_];
+            } else {
+                prev = (current_queue_index_ - 1 + sz) % sz;
+            }
         }
+
         PlayQueueAt(prev, screen_ref);
     }
 
@@ -889,14 +969,25 @@ struct AppUi::Impl {
                             center);
             items.push_back(filler());
             items.push_back(separator());
-            items.push_back(text("Enter: 播放  d: 移除  [/]: 上/下一首") | dim);
+            items.push_back(text("Enter: 播放  d: 移除  [/]: 上/下一首  r: 切换播放模式") | dim);
             return vbox(std::move(items)) | flex;
         }
 
         // 记录总条目数，供 CatchEvent 中 WheelDown 上界使用
         queue_total_ = static_cast<int>(play_queue_.size());
 
-        header.push_back(text("共 " + std::to_string(play_queue_.size()) + " 首") | dim);
+        // 在播放列表 Header 显示总数，并在最右侧显示当前播放模式提示
+        std::string mode_str;
+        if (settings.play_mode == 1) {
+            mode_str = "单曲循环";
+        } else if (settings.play_mode == 2) {
+            mode_str = "随机播放";
+        } else {
+            mode_str = "顺序播放";
+        }
+        // 根据 settings.play_mode 显示中文模式名
+        header.push_back(text("共 " + std::to_string(play_queue_.size()) + " 首       模式：" + mode_str) | dim | flex);
+
         header.push_back(separator());
 
         // 可见区域行数（由上一帧 reflect 写入的 Box 计算）
@@ -942,7 +1033,7 @@ struct AppUi::Impl {
         // 底部固定提示栏
         Elements footer;
         footer.push_back(separator());
-        footer.push_back(text("Enter: 播放  d: 移除  [/]: 上/下一首") | dim);
+        footer.push_back(text("Enter: 播放  d: 移除  [/]: 上/下一首  r: 切换播放模式") | dim);
 
         // flex + reflect：分配剩余空间并记录实际高度，供下一帧计算可见行数
         return vbox({
@@ -2249,6 +2340,26 @@ void AppUi::Run() {
         if (event == Event::Character('q')) {
             impl_->screen.Exit();
             return true;
+        }
+
+        // r 或 R 切换播放模式：仅在播放列表页面（selected_menu == 0）有效
+        if (impl_->selected_menu == 0 && event.is_character()) {
+            const auto ch = event.character();
+            if (!ch.empty() && std::tolower(static_cast<unsigned char>(ch[0])) == 'r') {
+                // 切换模式：0 -> 1 -> 2 -> 0
+                int next = (impl_->settings.play_mode + 1) % 3;
+                impl_->settings.play_mode = next;
+                impl_->screen.PostEvent(ftxui::Event::Custom);
+
+                // 异步保存配置文件（无需阻塞 UI）
+                std::string cfg = impl_->config_path;
+                gemusic::config::Settings s_copy = impl_->settings;  // 拷贝线程安全
+                std::thread([cfg, s_copy] {
+                    auto res = gemusic::config::SaveSettings(s_copy, cfg);
+                    (void)res;
+                }).detach();
+                return true;
+            }
         }
 
         // ── 全局：切换歌词面板显示/隐藏（l 键）──

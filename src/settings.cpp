@@ -63,6 +63,14 @@ auto LoadSettings(std::string_view path) -> std::expected<Settings, AppError> {
         if (config["s_device_id"]) {
             settings.s_device_id = config["s_device_id"].as<std::string>();
         }
+        // play_mode 存为整数：0=顺序,1=单曲循环,2=随机（若缺失则保持默认 0）
+        if (config["play_mode"]) {
+            try {
+                settings.play_mode = config["play_mode"].as<int>();
+            } catch (...) {
+                settings.play_mode = 0;
+            }
+        }
 
         return settings;
     } catch (const YAML::Exception& e) {
@@ -88,18 +96,22 @@ auto SaveSettings(const Settings& settings, std::string_view path)
         out << YAML::Key << "cache_dir" << YAML::Value << settings.cache_dir;
         out << YAML::Key << "music_library_path" << YAML::Value << settings.music_library_path;
         out << YAML::Key << "s_device_id" << YAML::Value << settings.s_device_id;
+        // play_mode: 0=顺序,1=单曲循环,2=随机（存为整数，便于外部脚本和老配置兼容）
+        out << YAML::Key << "play_mode" << YAML::Value << settings.play_mode;
         out << YAML::EndMap;
 
         // 确保父目录存在（首次运行时 ~/.config/GeMusic/ 可能尚未创建）
         std::filesystem::create_directories(std::filesystem::path(std::string(path)).parent_path());
 
-        // 写入文件
+        // 写入文件（在文件顶部添加 play_mode 的注释说明）
         std::ofstream fout{std::string(path)};
         if (!fout.is_open()) {
             return std::unexpected(
                 AppError{ErrorCode::kFileNotFound,
                          std::string("无法打开配置文件进行写入: ") + std::string(path)});
         }
+        // 在配置顶部写注释，说明 play_mode 的取值含义（保持为整数）
+        fout << "# play_mode: 0=顺序, 1=单曲循环, 2=随机 (请勿改为字符串)\n";
         fout << out.c_str();
         return {};
     } catch (const std::exception& e) {
