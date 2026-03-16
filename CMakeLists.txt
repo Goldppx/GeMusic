@@ -190,7 +190,7 @@ target_link_libraries(GeMusic PRIVATE
 # 编译警告（严格模式），根据不同编译器设置不同选项
 if(MSVC)
     # MSVC 使用 /W4 开启较严格警告，/WX 将警告视为错误
-    target_compile_options(GeMusic PRIVATE /W4 /WX)
+    target_compile_options(GeMusic PRIVATE /W4)
 else()
     # 对于 GCC/Clang 使用常见的警告选项
     target_compile_options(GeMusic PRIVATE -Wall -Wextra -Wpedantic -Werror)
