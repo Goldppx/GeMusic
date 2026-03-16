@@ -71,6 +71,14 @@ auto LoadSettings(std::string_view path) -> std::expected<Settings, AppError> {
                 settings.play_mode = 0;
             }
         }
+        // enable_mpris 存为整数：0=禁用,1=启用（若缺失则默认禁用）
+        if (config["enable_mpris"]) {
+            try {
+                settings.enable_mpris = config["enable_mpris"].as<int>();
+            } catch (...) {
+                settings.enable_mpris = 0;
+            }
+        }
 
         return settings;
     } catch (const YAML::Exception& e) {
@@ -98,6 +106,8 @@ auto SaveSettings(const Settings& settings, std::string_view path)
         out << YAML::Key << "s_device_id" << YAML::Value << settings.s_device_id;
         // play_mode: 0=顺序,1=单曲循环,2=随机（存为整数，便于外部脚本和老配置兼容）
         out << YAML::Key << "play_mode" << YAML::Value << settings.play_mode;
+        // enable_mpris: 0=禁用,1=启用（启用时程序会尝试注册 MPRIS 服务到用户 session bus）
+        out << YAML::Key << "enable_mpris" << YAML::Value << settings.enable_mpris;
         out << YAML::EndMap;
 
         // 确保父目录存在（首次运行时 ~/.config/GeMusic/ 可能尚未创建）
