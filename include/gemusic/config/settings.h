@@ -40,9 +40,6 @@ struct Settings {
     // 在配置文件中以整数形式保存（参见 src/settings.cpp 的注释）
     // 变更此字段会影响队列的 Next/Prev 行为
     int play_mode = 0;
-    // 是否启用 MPRIS 支持（0 = 禁用，1 = 启用）
-    // 启用后程序会尝试注册 MPRIS 服务到用户 session bus（需系统支持 sd-bus）
-    int enable_mpris = 0;
 };
 
 // 从 YAML 文件加载配置

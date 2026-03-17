@@ -237,11 +237,6 @@ struct AppUi::Impl {
         : settings(s), player(p), login_manager(lm), config_path(std::move(cfg_path)) {
         // 初始化时扫描本地音乐库
         RefreshLocalLibrary();
-        // 初始化 MPRIS 管理器（若启用）——实现将在后续补丁中完成
-        if (settings.enable_mpris) {
-            // 目前为占位：实际实现将使用 sd-bus 注册 MPRIS 接口
-            queue_status_ = "MPRIS: 启用（等待实现）";
-        }
     }
 
     // 扫描本地音乐库，更新文件列表
@@ -991,9 +986,7 @@ struct AppUi::Impl {
             mode_str = "顺序播放";
         }
         // 根据 settings.play_mode 显示中文模式名
-        header.push_back(
-            text("共 " + std::to_string(play_queue_.size()) + " 首       模式：" + mode_str) | dim |
-            flex);
+        header.push_back(text("共 " + std::to_string(play_queue_.size()) + " 首       模式：" + mode_str) | dim | flex);
 
         header.push_back(separator());
 
